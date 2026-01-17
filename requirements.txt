@@ -1,0 +1,7 @@
+streamlit
+pandas
+prophet
+matplotlib
+numpy
+openpyxl
+xlsxwriter
