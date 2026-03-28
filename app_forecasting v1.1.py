@@ -75,8 +75,7 @@ shrinkage_rate = st.sidebar.slider("Shrinkage Rate", 0.0, 0.5, 0.22, 0.01)
 hours_per_agent_day = st.sidebar.number_input("Jam Kerja/Agen/Hari", min_value=1, value=8)
 efficiency_factor = st.sidebar.slider("Faktor Efisiensi", 0.1, 1.0, 0.85, 0.01)
 
-# PERMINTAAN #2: FILTER TANGGAL HISTORI BISA DISESUAIKAN
-st.sidebar.header("📅 3. Konfigurasi Tanggal")
+st.sidebar.header("📅 3. Konfigurasi Tanggal Forecast")
 st.sidebar.markdown("**Data Historis (Training)**")
 start_hist = st.sidebar.date_input("Mulai Data Historis", pd.to_datetime('2024-12-01'))
 end_hist = st.sidebar.date_input("Akhir Data Historis", pd.to_datetime('2026-02-28'))
@@ -85,12 +84,17 @@ st.sidebar.markdown("**Target Forecast**")
 start_forecast = st.sidebar.date_input("Mulai Forecast", pd.to_datetime('2026-03-01'))
 end_forecast = st.sidebar.date_input("Akhir Forecast", pd.to_datetime('2026-03-31'))
 
+# FITUR BARU: Konfigurasi Hari Kalender & Hari Kerja
+st.sidebar.header("🗓️ 4. Parameter Bulanan (Headcount)")
+st.sidebar.markdown("Penentu kalkulasi total agen bulanan")
+hari_kalender = st.sidebar.number_input("Jumlah Hari Kalender", min_value=1, value=31, help="Total hari dalam bulan berjalan")
+hari_kerja = st.sidebar.number_input("Jumlah Hari Kerja (HKE)", min_value=1, value=22, help="Jumlah hari kerja efektif 1 agen dalam sebulan")
+
 # ==========================================
 # AREA UTAMA: PENGATURAN MODEL & ANOMALI
 # ==========================================
 st.write("### 🛠️ Pengaturan Model Prophet")
 
-# PERMINTAAN #1: FILTER ANOMALI DAPAT DISESUAIKAN DARI UI
 with st.expander("⚠️ Pengaturan Filter Anomali (Ubah Tanggal Anomali)", expanded=True):
     use_anomaly_filter = st.checkbox("✅ Aktifkan Filter Anomali", value=True, help="Menghapus data anomali pada rentang tanggal tertentu agar tidak merusak tren model.")
     
@@ -172,22 +176,16 @@ if uploaded_data is not None:
                 future['tanggal_satu'] = (future['ds'].dt.day == 1).astype(int)
                 
                 forecast = model.predict(future)
-                
-                # Memastikan tidak ada angka negatif
                 forecast['yhat_positive'] = forecast['yhat'].apply(lambda x: math.ceil(max(0, x)))
 
-                # PERMINTAAN #3: LOGIKA PENYESUAIAN HARI MINGGU (10% Lebih Rendah dari Sabtu)
-                # Kita iterasi pada DataFrame forecast untuk mencari hari Minggu
+                # LOGIKA PENYESUAIAN HARI MINGGU (10% Lebih Rendah dari Sabtu)
                 for i in range(1, len(forecast)):
-                    # weekday() -> 5 adalah Sabtu, 6 adalah Minggu
                     if forecast.loc[i, 'ds'].weekday() == 6: 
-                        # Pastikan baris sebelumnya benar-benar hari Sabtu
                         if forecast.loc[i-1, 'ds'].weekday() == 5:
                             sabtu_volume = forecast.loc[i-1, 'yhat_positive']
-                            # Set hari minggu = 90% dari sabtu (turun 10%)
                             forecast.loc[i, 'yhat_positive'] = math.ceil(sabtu_volume * 0.90)
 
-                # --- MENGHITUNG KEBUTUHAN AGEN ---
+                # --- MENGHITUNG KEBUTUHAN AGEN HARIAN ---
                 forecast['agents_needed'] = forecast['yhat_positive'].apply(
                     lambda x: calculate_agents_erlang_c(x, aht_seconds, target_sl, target_asa_seconds, shrinkage_rate, hours_per_agent_day)
                 )
@@ -203,6 +201,22 @@ if uploaded_data is not None:
                         hours_per_agent_day
                     ), axis=1
                 )
+
+                # FITUR BARU: KALKULASI HEADCOUNT BULANAN
+                total_shift_harian = forecast['agents_adjusted'].sum()
+                kebutuhan_headcount_bulanan = math.ceil(total_shift_harian / hari_kerja)
+
+                # --- TAMPILAN RINGKASAN KEBUTUHAN BULANAN ---
+                st.write("---")
+                st.write("### 🎯 Ringkasan Kebutuhan Headcount Bulanan")
+                
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                col_m1.metric("Hari Kalender Input", f"{hari_kalender} Hari")
+                col_m2.metric("Hari Kerja/Agen Input", f"{hari_kerja} Hari")
+                col_m3.metric("Total Kebutuhan Harian", f"{total_shift_harian} Shift", help="Akumulasi seluruh agen yang dibutuhkan setiap harinya selama periode forecast")
+                col_m4.metric("Kebutuhan Agen Bulanan", f"{kebutuhan_headcount_bulanan} Orang", help=f"Dihitung dari: {total_shift_harian} dibagi {hari_kerja}")
+
+                st.success(f"**Kesimpulan:** Berdasarkan total beban kerja sebanyak **{total_shift_harian} shift** dalam periode forecast, dan asumsi 1 agen bekerja efektif **{hari_kerja} hari** dalam sebulan, Anda membutuhkan total **{kebutuhan_headcount_bulanan} Agen** untuk memenuhi target SL.")
 
                 # --- VISUALISASI ---
                 st.write("---")
@@ -223,13 +237,10 @@ if uploaded_data is not None:
                 tabel_tampil = forecast[['ds', 'yhat_positive', 'agents_needed', 'agents_adjusted', 'SL_Projection']].copy()
                 tabel_tampil.columns = ['Tanggal', 'Prediksi COF (Adjusted)', 'Agen Dibutuhkan', 'Agen + Shrinkage/Efisiensi', 'Proyeksi SL']
                 
-                # Menambahkan penanda nama hari untuk mempermudah pengecekan aturan hari Minggu
                 tabel_tampil['Hari'] = tabel_tampil['Tanggal'].dt.day_name()
-                
                 tabel_tampil['Tanggal'] = tabel_tampil['Tanggal'].dt.strftime('%Y-%m-%d')
                 tabel_tampil['Proyeksi SL'] = tabel_tampil['Proyeksi SL'].apply(lambda x: f"{x:.2%}")
                 
-                # Susun ulang kolom agar nama hari ada di sebelah tanggal
                 tabel_tampil = tabel_tampil[['Tanggal', 'Hari', 'Prediksi COF (Adjusted)', 'Agen Dibutuhkan', 'Agen + Shrinkage/Efisiensi', 'Proyeksi SL']]
                 
                 st.dataframe(tabel_tampil, use_container_width=True)
