@@ -12,7 +12,7 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="WFM Forecast & Capacity Planner", layout="wide")
 st.title("WFM Forecast & Capacity Planning Tool")
 
-# --- FUNGSI ERLANG C ITERATIF (Mencegah Error Factorial) ---
+# --- FUNGSI ERLANG C ITERATIF ---
 def erlang_c_prob(agents, traffic):
     if agents <= traffic:
         return 1.0
@@ -27,13 +27,12 @@ def calculate_agents_erlang(cof, aht_seconds, max_wait_time):
     if pd.isna(cof) or pd.isna(aht_seconds) or cof <= 0:
         return 0, 0.0
     
-    interval_seconds = 1800 # 30 menit
+    interval_seconds = 1800 
     traffic = (cof * aht_seconds) / interval_seconds
     agents = math.ceil(traffic)
     
     while True:
         prob_wait = erlang_c_prob(agents, traffic)
-        # Average Speed of Answer (ASA)
         if agents > traffic:
             asa = prob_wait * (aht_seconds / (agents - traffic))
         else:
@@ -62,23 +61,38 @@ def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0):
     
     return cleansed_series, is_anomaly
 
-# --- FUNGSI FORECAST PROPHET ---
-def run_prophet(df_hist, df_payday, target_col, periods=1440): # 1440 = 30 hari x 48 interval
-    # Siapkan data untuk Prophet
+# --- FUNGSI FORECAST PROPHET (UPDATE HOLIDAYS) ---
+def run_prophet(df_hist, df_payday, df_holiday, target_col, periods=1440): 
     df_prophet = pd.DataFrame({
         'ds': df_hist['Datetime'],
         'y': df_hist[f'{target_col}_cleansed']
     })
     
-    # Siapkan Holidays (Pay Day)
-    holidays = None
+    # 1. Siapkan List Holidays
+    holidays_list = []
+    
+    # Tambahkan Pay Day jika ada
     if df_payday is not None and not df_payday.empty:
-        holidays = pd.DataFrame({
+        payday_df = pd.DataFrame({
             'holiday': 'payday',
             'ds': pd.to_datetime(df_payday['Date']),
             'lower_window': 0,
             'upper_window': 0
         })
+        holidays_list.append(payday_df)
+        
+    # Tambahkan Libur Nasional/Cuti Bersama jika ada
+    if df_holiday is not None and not df_holiday.empty:
+        nat_holiday_df = pd.DataFrame({
+            'holiday': 'national_holiday', # Label ini membuat Prophet membandingkannya sesama hari libur
+            'ds': pd.to_datetime(df_holiday['Date']),
+            'lower_window': 0,
+            'upper_window': 0
+        })
+        holidays_list.append(nat_holiday_df)
+        
+    # Gabungkan semua hari libur/spesial
+    holidays = pd.concat(holidays_list, ignore_index=True) if holidays_list else None
         
     model = Prophet(holidays=holidays, daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
     model.fit(df_prophet)
@@ -86,23 +100,22 @@ def run_prophet(df_hist, df_payday, target_col, periods=1440): # 1440 = 30 hari 
     future = model.make_future_dataframe(periods=periods, freq='30T')
     forecast = model.predict(future)
     
-    # Hitung MAPE di data historis (Fitted vs Actual)
     historical_forecast = forecast.iloc[:len(df_prophet)]
     mape = mean_absolute_percentage_error(df_prophet['y'], historical_forecast['yhat']) * 100
     
-    # Ambil hanya nilai masa depan
     future_forecast = forecast.iloc[len(df_prophet):][['ds', 'yhat']]
     future_forecast.rename(columns={'ds': 'Datetime', 'yhat': f'{target_col}_forecast'}, inplace=True)
-    future_forecast[f'{target_col}_forecast'] = future_forecast[f'{target_col}_forecast'].clip(lower=0) # Hindari nilai minus
+    future_forecast[f'{target_col}_forecast'] = future_forecast[f'{target_col}_forecast'].clip(lower=0) 
     
     return future_forecast, mape
 
 # --- UI SIDEBAR ---
 st.sidebar.header("1. Upload Database")
-st.sidebar.markdown("*(Pastikan ada kolom **Datetime** untuk data Interval dan **Date** untuk Pay Day)*")
+st.sidebar.markdown("*(Pastikan data Interval memiliki kolom **Datetime**, dan data Event/Libur memiliki kolom **Date**)*")
 file_cof = st.sidebar.file_uploader("Upload Data COF (Interval 30 Min)", type=['csv', 'xlsx'])
 file_aht = st.sidebar.file_uploader("Upload Data AHT (Interval 30 Min)", type=['csv', 'xlsx'])
-file_payday = st.sidebar.file_uploader("Upload Data Pay Day", type=['csv', 'xlsx'])
+file_payday = st.sidebar.file_uploader("Upload Data Pay Day (Opsional)", type=['csv', 'xlsx'])
+file_holiday = st.sidebar.file_uploader("Upload Data Libur Nasional & Cuti Bersama (Opsional)", type=['csv', 'xlsx'])
 
 st.sidebar.header("2. Konfigurasi Erlang C")
 shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
@@ -122,6 +135,10 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_payday = None
             if file_payday:
                 df_payday = pd.read_csv(file_payday) if file_payday.name.endswith('csv') else pd.read_excel(file_payday)
+                
+            df_holiday = None
+            if file_holiday:
+                df_holiday = pd.read_csv(file_holiday) if file_holiday.name.endswith('csv') else pd.read_excel(file_holiday)
             
             df_cof['Datetime'] = pd.to_datetime(df_cof['Datetime'])
             df_aht['Datetime'] = pd.to_datetime(df_aht['Datetime'])
@@ -130,10 +147,10 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF')
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT')
             
-            # 3. Forecasting Prophet
+            # 3. Forecasting Prophet dengan Holiday Setup
             intervals_to_forecast = forecast_days * 48
-            forecast_cof, mape_cof = run_prophet(df_cof, df_payday, 'COF', intervals_to_forecast)
-            forecast_aht, mape_aht = run_prophet(df_aht, df_payday, 'AHT', intervals_to_forecast)
+            forecast_cof, mape_cof = run_prophet(df_cof, df_payday, df_holiday, 'COF', intervals_to_forecast)
+            forecast_aht, mape_aht = run_prophet(df_aht, df_payday, df_holiday, 'AHT', intervals_to_forecast)
             
             # Gabungkan Hasil Forecast
             df_result = pd.merge(forecast_cof, forecast_aht, on='Datetime')
@@ -151,12 +168,10 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
             
             # Kalkulasi Headcount Bulanan
-            # Ambil puncak maksimum agen dalam satu hari untuk menentukan headcount
             df_result['Date'] = df_result['Datetime'].dt.date
             max_agents_per_day = df_result.groupby('Date')['Agent_Needed_Adjust'].max()
             avg_daily_headcount_needed = max_agents_per_day.mean()
             
-            # Asumsi: Agent bekerja bergantian. Total headcount = (Kebutuhan shift puncak harian * 30 hari) / Hari kerja agen
             total_monthly_headcount = math.ceil((avg_daily_headcount_needed * forecast_days) / work_days)
 
             # --- TAMPILAN HASIL (UI) ---
