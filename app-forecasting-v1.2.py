@@ -50,7 +50,7 @@ def find_required_agents(cof, aht_seconds, target_sl, target_time):
             
     return agents, asa, sl
 
-# --- FUNGSI CLEANSING HOLT-WINTERS (DENGAN PENGAMAN) ---
+# --- FUNGSI CLEANSING HOLT-WINTERS ---
 def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0):
     series = df[target_col].ffill().bfill()
     if len(series) < (2 * seasonal_periods):
@@ -157,7 +157,22 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                     
                 df_res['Agent_Needed_Adjust'] = np.ceil(df_res['Base_Agent_Needed'] / (1 - shrinkage))
                 
-                # Menyiapkan Dataframe Final (Update Kolom)
+                # --- UPDATE LOGIKA FTE & WORKSTATION ---
+                df_res['DateOnly'] = df_res['Datetime'].dt.date
+                
+                # 1. Kebutuhan Workstation (Nilai Peak tertinggi dari Agent_With_Shrinkage)
+                max_workstation = int(df_res['Agent_Needed_Adjust'].max())
+                
+                # 2. Kalkulasi Headcount Harian (Metode FTE)
+                # Jumlahkan seluruh slot interval per hari, lalu bagi kapasitas agen (jam kerja x 2)
+                daily_slots = df_res.groupby('DateOnly')['Agent_Needed_Adjust'].sum()
+                daily_headcount = np.ceil(daily_slots / (work_hours * 2))
+                
+                # 3. Kalkulasi Headcount Bulanan
+                # Jumlahkan seluruh kebutuhan harian, lalu bagi dengan hari kerja sebulan
+                total_monthly_headcount = math.ceil(daily_headcount.sum() / work_days)
+                
+                # Menyiapkan Dataframe Final
                 df_final = pd.DataFrame({
                     'Date': df_res['Datetime'].dt.date,
                     'Interval': df_res['Datetime'].dt.strftime('%H:%M'),
@@ -183,19 +198,19 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                     col_m2.metric("MAPE AHT", f"{mape_aht:.2f}%")
                     
                     if mape_cof > 15 or mape_aht > 15:
-                        st.warning("⚠️ Nilai MAPE di atas 15%. Disarankan untuk menjalankan ulang (re-run) dengan menambah rentang rentang data historis agar akurasi lebih stabil.")
+                        st.warning("⚠️ Nilai MAPE di atas 15%. Disarankan untuk merevisi parameter peramalan (Prophet) atau rentang data historis.")
                     else:
                         st.success("✅ Akurasi model dalam batas yang sangat baik.")
                         
                 with tab3:
-                    st.subheader("Ringkasan Kapasitas Agent")
+                    st.subheader("Ringkasan Kapasitas Agent & Fasilitas")
                     
-                    # Metrik Ringkasan
+                    # Metrik Ringkasan yang Diperbarui
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Total COF Forecast", f"{int(df_res['COF_forecast'].sum()):,}")
-                    c2.metric("Max Agent (Peak)", int(df_res['Agent_Needed_Adjust'].max()))
+                    c2.metric("Kebutuhan Workstation (WS)", max_workstation)
                     c3.metric("Avg Projected SL", f"{(df_res['Projected_SL'].mean() * 100):.2f}%")
-                    c4.metric("Headcount Bulanan", int(total_monthly_headcount if 'total_monthly_headcount' in locals() else math.ceil((df_res.groupby(df_res['Datetime'].dt.date)['Agent_Needed_Adjust'].max().mean() * forecast_days) / work_days)))
+                    c4.metric("Headcount Bulanan (FTE)", int(total_monthly_headcount))
 
                     st.write("**Tabel Detail Kebutuhan Agent per Interval**")
                     st.dataframe(df_final, use_container_width=True)
