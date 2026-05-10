@@ -199,4 +199,23 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                         
                     with tab2:
                         col1, col2 = st.columns(2)
-                        col1.metric(
+                        col1.metric(label="MAPE COF (Historical Fit)", value=f"{mape_cof:.2f}%")
+                        col2.metric(label="MAPE AHT (Historical Fit)", value=f"{mape_aht:.2f}%")
+                        if mape_cof > 15 or mape_aht > 15:
+                            st.warning("⚠️ Nilai MAPE di atas 15%. Anda mungkin perlu memperlebar rentang Data Historis agar model dapat belajar lebih banyak pola.")
+                        else:
+                            st.success("✅ Akurasi model sangat baik berdasarkan data latih yang dipilih.")
+                            
+                    with tab3:
+                        st.subheader("Ringkasan Kapasitas (Kalkulasi Erlang C)")
+                        
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Max Kebutuhan Agent per Interval", int(df_result['Agent_Needed_Adjust'].max()))
+                        c2.metric("Rata-rata Wait Time Proyeksi (Detik)", f"{df_result['Projected_Wait_Time'].mean():.2f}")
+                        c3.metric("Estimasi Total Headcount Bulanan", total_monthly_headcount)
+                        
+                        st.write("**Detail Interval Forecast & Agent**")
+                        st.dataframe(df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Projected_Wait_Time', 'Agent_Needed_Adjust']], use_container_width=True)
+
+    else:
+        st.error("Mohon unggah file COF dan AHT terlebih dahulu.")
