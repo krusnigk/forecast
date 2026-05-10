@@ -5,3 +5,5 @@ matplotlib
 numpy
 openpyxl
 xlsxwriter
+statsmodels
+scikit-learn
