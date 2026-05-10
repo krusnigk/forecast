@@ -50,7 +50,7 @@ def find_required_agents(cof, aht_seconds, target_sl, target_time):
             
     return agents, asa, sl
 
-# --- FUNGSI CLEANSING HOLT-WINTERS ---
+# --- FUNGSI CLEANSING HOLT-WINTERS (DENGAN PENGAMAN) ---
 def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0):
     series = df[target_col].ffill().bfill()
     if len(series) < (2 * seasonal_periods):
@@ -120,79 +120,97 @@ forecast_days = (end_forecast_date - start_forecast_date).days + 1
 # --- PROSES UTAMA ---
 if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
     if file_cof and file_aht:
-        if start_history_date > end_history_date or start_forecast_date > end_forecast_date:
-            st.error("Periksa kembali urutan tanggal input Anda.")
-        else:
-            with st.spinner("Sedang memproses..."):
-                df_cof = pd.read_csv(file_cof) if file_cof.name.endswith('csv') else pd.read_excel(file_cof)
-                df_aht = pd.read_csv(file_aht) if file_aht.name.endswith('csv') else pd.read_excel(file_aht)
-                df_payday = pd.read_csv(file_payday) if (file_payday and file_payday.name.endswith('csv')) else pd.read_excel(file_payday) if file_payday else None
-                df_holiday = pd.read_csv(file_holiday) if (file_holiday and file_holiday.name.endswith('csv')) else pd.read_excel(file_holiday) if file_holiday else None
+        with st.spinner("Sedang memproses data..."):
+            df_cof = pd.read_csv(file_cof) if file_cof.name.endswith('csv') else pd.read_excel(file_cof)
+            df_aht = pd.read_csv(file_aht) if file_aht.name.endswith('csv') else pd.read_excel(file_aht)
+            df_payday = pd.read_csv(file_payday) if (file_payday and file_payday.name.endswith('csv')) else pd.read_excel(file_payday) if file_payday else None
+            df_holiday = pd.read_csv(file_holiday) if (file_holiday and file_holiday.name.endswith('csv')) else pd.read_excel(file_holiday) if file_holiday else None
+            
+            df_cof['Datetime'] = pd.to_datetime(df_cof['Datetime'])
+            df_aht['Datetime'] = pd.to_datetime(df_aht['Datetime'])
+            
+            start_hist_dt = pd.to_datetime(start_history_date)
+            end_hist_dt = pd.to_datetime(end_history_date) + pd.Timedelta(hours=23, minutes=59)
+            
+            df_cof = df_cof[(df_cof['Datetime'] >= start_hist_dt) & (df_cof['Datetime'] <= end_hist_dt)]
+            df_aht = df_aht[(df_aht['Datetime'] >= start_hist_dt) & (df_aht['Datetime'] <= end_hist_dt)]
+            
+            if df_cof.empty:
+                st.error("Data Historis kosong pada rentang tanggal tersebut.")
+            else:
+                df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF')
+                df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT')
                 
-                df_cof['Datetime'] = pd.to_datetime(df_cof['Datetime'])
-                df_aht['Datetime'] = pd.to_datetime(df_aht['Datetime'])
+                fcst_cof, mape_cof = run_prophet(df_cof, df_payday, df_holiday, 'COF', start_forecast_date, end_forecast_date)
+                fcst_aht, mape_aht = run_prophet(df_aht, df_payday, df_holiday, 'AHT', start_forecast_date, end_forecast_date)
                 
-                start_hist_dt = pd.to_datetime(start_history_date)
-                end_hist_dt = pd.to_datetime(end_history_date) + pd.Timedelta(hours=23, minutes=59)
+                df_res = pd.merge(fcst_cof, fcst_aht, on='Datetime')
                 
-                df_cof = df_cof[(df_cof['Datetime'] >= start_hist_dt) & (df_cof['Datetime'] <= end_hist_dt)]
-                df_aht = df_aht[(df_aht['Datetime'] >= start_hist_dt) & (df_aht['Datetime'] <= end_hist_dt)]
+                # Kalkulasi Erlang C
+                df_res['Base_Agent_Needed'] = 0
+                df_res['Projected_SL'] = 0.0
                 
-                if df_cof.empty:
-                    st.error("Data Historis kosong pada rentang tanggal tersebut.")
-                else:
-                    df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF')
-                    df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT')
+                for index, row in df_res.iterrows():
+                    agents, _, sl = find_required_agents(row['COF_forecast'], row['AHT_forecast'], target_sl_pct, target_asa_sec)
+                    df_res.at[index, 'Base_Agent_Needed'] = agents
+                    df_res.at[index, 'Projected_SL'] = sl
                     
-                    fcst_cof, mape_cof = run_prophet(df_cof, df_payday, df_holiday, 'COF', start_forecast_date, end_forecast_date)
-                    fcst_aht, mape_aht = run_prophet(df_aht, df_payday, df_holiday, 'AHT', start_forecast_date, end_forecast_date)
-                    
-                    df_res = pd.merge(fcst_cof, fcst_aht, on='Datetime')
-                    
-                    df_res['Base_Agent_Needed'] = 0
-                    df_res['Projected_SL'] = 0.0
-                    
-                    for index, row in df_res.iterrows():
-                        agents, _, sl = find_required_agents(row['COF_forecast'], row['AHT_forecast'], target_sl_pct, target_asa_sec)
-                        df_res.at[index, 'Base_Agent_Needed'] = agents
-                        df_res.at[index, 'Projected_SL'] = sl
-                        
-                    df_res['Agent_Needed_Adjust'] = np.ceil(df_res['Base_Agent_Needed'] / (1 - shrinkage))
-                    
-                    # Final Dataframe
-                    df_final = pd.DataFrame({
-                        'Date': df_res['Datetime'].dt.date,
-                        'Interval': df_res['Datetime'].dt.strftime('%H:%M'),
-                        'AHT_Forecast': df_res['AHT_forecast'].round(2),
-                        'Base_Agent_Erlang': df_res['Base_Agent_Needed'].astype(int),
-                        'Agent_With_Shrinkage': df_res['Agent_Needed_Adjust'].astype(int),
-                        'Projected_SL_Pct': (df_res['Projected_SL'] * 100).round(2)
-                    })
+                df_res['Agent_Needed_Adjust'] = np.ceil(df_res['Base_Agent_Needed'] / (1 - shrinkage))
+                
+                # Menyiapkan Dataframe Final (Update Kolom)
+                df_final = pd.DataFrame({
+                    'Date': df_res['Datetime'].dt.date,
+                    'Interval': df_res['Datetime'].dt.strftime('%H:%M'),
+                    'COF_Forecast': df_res['COF_forecast'].round(0).astype(int),
+                    'AHT_Forecast': df_res['AHT_forecast'].round(2),
+                    'Base_Agent_Erlang': df_res['Base_Agent_Needed'].astype(int),
+                    'Agent_With_Shrinkage': df_res['Agent_Needed_Adjust'].astype(int),
+                    'Projected_SL_Pct': (df_res['Projected_SL'] * 100).round(2)
+                })
 
-                    st.success("Kalkulasi Selesai!")
+                st.success(f"Kalkulasi Selesai untuk {forecast_days} hari!")
+                
+                tab1, tab2, tab3 = st.tabs(["📊 Visualisasi Forecast", "🎯 Akurasi (MAPE)", "👥 Kapasitas Agent"])
+                
+                with tab1:
+                    st.subheader("Prediksi Volume & Durasi")
+                    st.line_chart(df_res.set_index('Datetime')['COF_forecast'])
+                    st.line_chart(df_res.set_index('Datetime')['AHT_forecast'])
                     
-                    tab1, tab2, tab3 = st.tabs(["📊 Forecast", "🎯 Akurasi", "👥 Kapasitas Agent"])
+                with tab2:
+                    col_m1, col_m2 = st.columns(2)
+                    col_m1.metric("MAPE COF", f"{mape_cof:.2f}%")
+                    col_m2.metric("MAPE AHT", f"{mape_aht:.2f}%")
                     
-                    with tab1:
-                        st.line_chart(df_res.set_index('Datetime')['COF_forecast'])
-                        st.line_chart(df_res.set_index('Datetime')['AHT_forecast'])
-                    with tab2:
-                        st.metric("MAPE COF", f"{mape_cof:.2f}%")
-                        st.metric("MAPE AHT", f"{mape_aht:.2f}%")
-                    with tab3:
-                        st.dataframe(df_final, use_container_width=True)
+                    if mape_cof > 15 or mape_aht > 15:
+                        st.warning("⚠️ Nilai MAPE di atas 15%. Disarankan untuk menjalankan ulang (re-run) dengan menambah rentang rentang data historis agar akurasi lebih stabil.")
+                    else:
+                        st.success("✅ Akurasi model dalam batas yang sangat baik.")
                         
-                        # --- FITUR DOWNLOAD XLSX ---
-                        buffer = io.BytesIO()
-                        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                            df_final.to_excel(writer, index=False, sheet_name='Capacity_Plan')
-                        
-                        st.download_button(
-                            label="📥 Download Hasil Kalkulasi (.xlsx)",
-                            data=buffer.getvalue(),
-                            file_name=f"WFM_Plan_{start_forecast_date}_to_{end_forecast_date}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
+                with tab3:
+                    st.subheader("Ringkasan Kapasitas Agent")
+                    
+                    # Metrik Ringkasan
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Total COF Forecast", f"{int(df_res['COF_forecast'].sum()):,}")
+                    c2.metric("Max Agent (Peak)", int(df_res['Agent_Needed_Adjust'].max()))
+                    c3.metric("Avg Projected SL", f"{(df_res['Projected_SL'].mean() * 100):.2f}%")
+                    c4.metric("Headcount Bulanan", int(total_monthly_headcount if 'total_monthly_headcount' in locals() else math.ceil((df_res.groupby(df_res['Datetime'].dt.date)['Agent_Needed_Adjust'].max().mean() * forecast_days) / work_days)))
+
+                    st.write("**Tabel Detail Kebutuhan Agent per Interval**")
+                    st.dataframe(df_final, use_container_width=True)
+                    
+                    # --- DOWNLOAD XLSX ---
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                        df_final.to_excel(writer, index=False, sheet_name='WFM_Capacity_Plan')
+                    
+                    st.download_button(
+                        label="📥 Download Hasil Kalkulasi (.xlsx)",
+                        data=buffer.getvalue(),
+                        file_name=f"WFM_Plan_{start_forecast_date}_to_{end_forecast_date}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
 
     else:
-        st.error("Mohon unggah file database terlebih dahulu.")
+        st.error("Mohon unggah file database terlebih dahulu di sidebar.")
