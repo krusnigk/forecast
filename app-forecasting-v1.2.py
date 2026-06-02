@@ -45,7 +45,6 @@ def calculate_agents_erlang(cof, aht_seconds, max_wait_time):
     return agents, asa
 
 # --- FUNGSI CLEANSING HOLT-WINTERS ---
-# Tetap menggunakan min_residual agar jam malam tidak terpotong habis
 def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_residual=15):
     series = df[target_col].fillna(method='ffill').fillna(method='bfill')
     
@@ -56,7 +55,6 @@ def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_resi
     residuals = np.abs(series - fitted_values)
     std_dev = np.std(residuals)
     
-    # Anomali: harus lebih dari std_dev threshold DAN selisihnya > min_residual
     is_anomaly = (residuals > (threshold * std_dev)) & (residuals > min_residual)
     
     cleansed_series = series.copy()
@@ -65,31 +63,68 @@ def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_resi
     return cleansed_series, is_anomaly
 
 # --- FUNGSI FORECAST PROPHET ---
-def run_prophet(df_hist, df_payday, target_col, start_fcst, end_fcst):
+def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto_payday=True):
     df_prophet = pd.DataFrame({
         'ds': df_hist['Datetime'],
         'y': df_hist[f'{target_col}_cleansed']
     })
     
-    # Mencegah error pada mode multiplikatif jika ada nilai 0
     df_prophet['y'] = df_prophet['y'].replace(0, 0.01)
     
-    holidays = None
-    if df_payday is not None and not df_payday.empty:
-        holidays = pd.DataFrame({
+    holidays_list = []
+    holiday_dates = []
+    
+    # 1. Masukkan Hari Libur Nasional
+    if df_holidays is not None and not df_holidays.empty:
+        if 'Tanggal' in df_holidays.columns:
+            h_df = pd.DataFrame({
+                'holiday': 'libur_nasional',
+                'ds': pd.to_datetime(df_holidays['Tanggal']),
+                'lower_window': 0,
+                'upper_window': 0
+            })
+            holidays_list.append(h_df)
+            # Simpan tanggal libur dalam bentuk list (tanpa jam) untuk pengecekan payday
+            holiday_dates = pd.to_datetime(df_holidays['Tanggal']).dt.normalize().tolist()
+            
+    # 2. Masukkan Logika Payday Otomatis
+    if use_auto_payday:
+        start_date = df_prophet['ds'].min()
+        end_date = pd.to_datetime(end_fcst)
+        
+        # Ambil semua bulan dari awal histori sampai akhir forecast
+        dr = pd.date_range(start=start_date, end=end_date)
+        months = dr.to_period('M').unique()
+        
+        paydays = []
+        for m in months:
+            # Tanggal 1
+            dt_1 = pd.Timestamp(year=m.year, month=m.month, day=1)
+            paydays.append(dt_1)
+            
+            # Tanggal 25
+            dt_25 = pd.Timestamp(year=m.year, month=m.month, day=25)
+            # LOGIKA: Jika sabtu (5), minggu (6), atau hari libur -> dimajukan 1 hari
+            while dt_25.weekday() >= 5 or dt_25 in holiday_dates:
+                dt_25 -= pd.Timedelta(days=1)
+            paydays.append(dt_25)
+            
+        p_df = pd.DataFrame({
             'holiday': 'payday',
-            'ds': pd.to_datetime(df_payday['Date']),
+            'ds': list(set(paydays)),
             'lower_window': 0,
             'upper_window': 0
         })
+        holidays_list.append(p_df)
         
-    # Tetap menggunakan mode multiplikatif
-    model = Prophet(holidays=holidays, daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, seasonality_mode='multiplicative')
+    # Gabungkan semua hari libur dan payday menjadi satu DataFrame untuk Prophet
+    final_holidays = pd.concat(holidays_list, ignore_index=True) if holidays_list else None
+        
+    model = Prophet(holidays=final_holidays, daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, seasonality_mode='multiplicative')
     model.fit(df_prophet)
     
-    # Menghitung durasi ke masa depan (dari akhir data historis sampai akhir tanggal forecast)
     last_hist_date = df_prophet['ds'].max()
-    end_fcst_dt = pd.to_datetime(end_fcst) + pd.Timedelta(days=1, minutes=-30) # Sampai 23:30 di hari terakhir forecast
+    end_fcst_dt = pd.to_datetime(end_fcst) + pd.Timedelta(days=1, minutes=-30)
     
     if end_fcst_dt > last_hist_date:
         delta = end_fcst_dt - last_hist_date
@@ -100,11 +135,9 @@ def run_prophet(df_hist, df_payday, target_col, start_fcst, end_fcst):
     future = model.make_future_dataframe(periods=periods, freq='30T', include_history=True)
     forecast = model.predict(future)
     
-    # Hitung MAPE di area historis
     historical_forecast = forecast.iloc[:len(df_prophet)]
     mape = mean_absolute_percentage_error(df_prophet['y'], historical_forecast['yhat']) * 100
     
-    # Ambil nilai forecast hanya pada rentang tanggal start_fcst s/d end_fcst
     start_fcst_dt = pd.to_datetime(start_fcst)
     future_forecast = forecast[(forecast['ds'] >= start_fcst_dt) & (forecast['ds'] <= end_fcst_dt)][['ds', 'yhat']]
     future_forecast.rename(columns={'ds': 'Datetime', 'yhat': f'{target_col}_forecast'}, inplace=True)
@@ -114,10 +147,9 @@ def run_prophet(df_hist, df_payday, target_col, start_fcst, end_fcst):
 
 # --- UI SIDEBAR ---
 st.sidebar.header("📂 1. Upload Database")
-st.sidebar.markdown("*(Pastikan ada kolom **Datetime** untuk Interval & **Date** untuk Pay Day)*")
 file_cof = st.sidebar.file_uploader("Upload Data COF (Interval 30 Min)", type=['csv', 'xlsx'])
 file_aht = st.sidebar.file_uploader("Upload Data AHT (Interval 30 Min)", type=['csv', 'xlsx'])
-file_payday = st.sidebar.file_uploader("Upload Data Pay Day (Opsional)", type=['csv', 'xlsx'])
+file_holidays = st.sidebar.file_uploader("Upload Data Libur Nasional (Opsional)", type=['csv', 'xlsx'])
 
 st.sidebar.header("⚙️ 2. Konfigurasi Erlang C")
 shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
@@ -125,7 +157,6 @@ max_wait_time = st.sidebar.number_input("Max Waiting Time (Detik)", value=20)
 work_hours = st.sidebar.number_input("Jam Kerja per Hari", value=8)
 work_days = st.sidebar.number_input("Hari Kerja/Agen/Bulan", value=22)
 
-# DIKEMBALIKAN: Input Tanggal
 st.sidebar.header("📅 3. Konfigurasi Tanggal")
 st.sidebar.markdown("**Data Historis (Training)**")
 start_hist = st.sidebar.date_input("Mulai Data Historis", pd.to_datetime('2024-02-01'))
@@ -135,38 +166,37 @@ st.sidebar.markdown("**Target Forecast**")
 start_forecast = st.sidebar.date_input("Mulai Forecast", pd.to_datetime('2026-06-01'))
 end_forecast = st.sidebar.date_input("Akhir Forecast", pd.to_datetime('2026-06-30'))
 
+# CHECKBOX BARU UNTUK FITUR PAYDAY OTOMATIS
+use_payday = st.sidebar.checkbox("💰 Aktifkan Auto-Payday (Tgl 1 & 25)", value=True, help="Menandai otomatis tgl 1 & 25 sbg payday. Jika tgl 25 libur/weekend, mundur ke hari kerja sebelumnya.")
+
 # --- PROSES UTAMA ---
 if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
     if file_cof and file_aht:
-        with st.spinner("Memproses cleansing dan forecasting, mohon tunggu..."):
-            # 1. Baca Data
+        with st.spinner("Memproses cleansing, payday, dan forecasting. Mohon tunggu..."):
             df_cof = pd.read_csv(file_cof) if file_cof.name.endswith('csv') else pd.read_excel(file_cof)
             df_aht = pd.read_csv(file_aht) if file_aht.name.endswith('csv') else pd.read_excel(file_aht)
             
-            df_payday = None
-            if file_payday:
-                df_payday = pd.read_csv(file_payday) if file_payday.name.endswith('csv') else pd.read_excel(file_payday)
+            df_holidays = None
+            if file_holidays:
+                df_holidays = pd.read_csv(file_holidays) if file_holidays.name.endswith('csv') else pd.read_excel(file_holidays)
             
             df_cof['Datetime'] = pd.to_datetime(df_cof['Datetime'])
             df_aht['Datetime'] = pd.to_datetime(df_aht['Datetime'])
             
-            # Filter Data Historis berdasarkan input kalender user
-            # Ditambah 1 hari - 1 detik agar meng-cover sampai 23:59 di hari terakhir historis
             df_cof = df_cof[(df_cof['Datetime'] >= pd.to_datetime(start_hist)) & (df_cof['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             df_aht = df_aht[(df_aht['Datetime'] >= pd.to_datetime(start_hist)) & (df_aht['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             
-            # 2. Cleansing Data (Holt-Winters)
+            # Cleansing
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
             
-            # 3. Forecasting Prophet menggunakan kalender input
-            forecast_cof, mape_cof = run_prophet(df_cof, df_payday, 'COF', start_forecast, end_forecast)
-            forecast_aht, mape_aht = run_prophet(df_aht, df_payday, 'AHT', start_forecast, end_forecast)
+            # Forecasting dengan melempar variabel use_payday
+            forecast_cof, mape_cof = run_prophet(df_cof, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
+            forecast_aht, mape_aht = run_prophet(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
             
-            # Gabungkan Hasil Forecast
             df_result = pd.merge(forecast_cof, forecast_aht, on='Datetime')
             
-            # 4. Kalkulasi Erlang C per Interval
+            # Erlang C Kalkulasi
             df_result['Base_Agent_Needed'] = 0
             df_result['Projected_Wait_Time'] = 0.0
             
@@ -175,10 +205,8 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 df_result.at[index, 'Base_Agent_Needed'] = agents
                 df_result.at[index, 'Projected_Wait_Time'] = wait_time
                 
-            # Hitung Agent Adjusted (Dengan Shrinkage)
             df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
             
-            # Kalkulasi Headcount Bulanan menggunakan selisih hari forecast
             df_result['Date'] = df_result['Datetime'].dt.date
             max_agents_per_day = df_result.groupby('Date')['Agent_Needed_Adjust'].max()
             avg_daily_headcount_needed = max_agents_per_day.mean()
@@ -212,7 +240,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Max Kebutuhan Agent per Interval", int(df_result['Agent_Needed_Adjust'].max()))
                 c2.metric("Rata-rata Wait Time Proyeksi (Detik)", f"{df_result['Projected_Wait_Time'].mean():.2f}")
-                c3.metric("Estimasi Total Headcount Bulanan", total_monthly_headcount, help=f"Dihitung berdasarkan forecast selama {total_hari_forecast} hari dibagi {work_days} hari kerja efektif.")
+                c3.metric("Estimasi Total Headcount Bulanan", total_monthly_headcount)
                 
                 st.write("**Detail Interval Forecast & Agent**")
                 st.dataframe(df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Projected_Wait_Time', 'Agent_Needed_Adjust']], use_container_width=True)
