@@ -23,7 +23,6 @@ def erlang_c_prob(agents, traffic):
     erlang_c = erlang_b / (1.0 - (traffic / agents) * (1.0 - erlang_b))
     return max(0.0, min(1.0, erlang_c))
 
-# PERBAIKAN: Fungsi Erlang C sekarang menghitung Service Level (SL)
 def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time):
     if pd.isna(cof) or pd.isna(aht_seconds) or cof <= 0:
         return 0, 0.0, 1.0
@@ -37,15 +36,12 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time):
     while True:
         prob_wait = erlang_c_prob(agents, traffic)
         if agents > traffic:
-            # Hitung ASA (Average Speed of Answer)
             asa = prob_wait * (aht_seconds / (agents - traffic))
-            # Hitung persentase Service Level (SL)
             sl = 1 - (prob_wait * math.exp(-(agents - traffic) * max_wait_time / aht_seconds))
         else:
             asa = float('inf')
             sl = 0.0
             
-        # Berhenti menambah agen jika SL sudah mencapai atau melebihi target SL (misal: 90%)
         if sl >= target_sl:
             break
         agents += 1
@@ -132,7 +128,8 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
     else:
         periods = 0
         
-    future = model.make_future_dataframe(periods=periods, freq='30T', include_history=True)
+    # PERBAIKAN PANDAS: '30T' diubah menjadi '30min'
+    future = model.make_future_dataframe(periods=periods, freq='30min', include_history=True)
     forecast = model.predict(future)
     
     historical_forecast = forecast.iloc[:len(df_prophet)]
@@ -153,7 +150,6 @@ file_aht = st.sidebar.file_uploader("Upload Data AHT (Interval 30 Min)", type=['
 file_holidays = st.sidebar.file_uploader("Upload Data Libur Nasional (Opsional)", type=['csv', 'xlsx'])
 
 st.sidebar.header("⚙️ 2. Konfigurasi Erlang C")
-# PERBAIKAN: Menambahkan kembali Target SL di Sidebar
 target_sl = st.sidebar.slider("Target Service Level (%)", min_value=50, max_value=100, value=90) / 100
 max_wait_time = st.sidebar.number_input("Target ASA / Max Wait Time (Detik)", value=20, help="Target waktu angkat telepon")
 shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
@@ -204,7 +200,6 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_result['Service_Level_Achieved'] = 0.0
             
             for index, row in df_result.iterrows():
-                # PERBAIKAN: Memasukkan parameter target_sl
                 agents, wait_time, sl_achieved = calculate_agents_erlang(row['COF_forecast'], row['AHT_forecast'], target_sl, max_wait_time)
                 df_result.at[index, 'Base_Agent_Needed'] = agents
                 df_result.at[index, 'Projected_Wait_Time'] = wait_time
@@ -244,13 +239,12 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Max Agent per Interval", int(df_result['Agent_Needed_Adjust'].max()))
-                c2.metric("Target SL", f"{target_sl*100}% dalam {max_wait_time}s")
+                c2.metric("Target SL", f"{int(target_sl*100)}% dalam {int(max_wait_time)}s")
                 c3.metric("Rata-rata Wait Time Proyeksi", f"{df_result['Projected_Wait_Time'].mean():.2f} s")
                 c4.metric("Total Headcount Bulanan", total_monthly_headcount)
                 
                 st.write("**Detail Interval Forecast & Agent**")
                 
-                # Format SL menjadi persentase agar mudah dibaca di tabel
                 tabel_tampil = df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Service_Level_Achieved', 'Projected_Wait_Time']].copy()
                 tabel_tampil['Service_Level_Achieved'] = tabel_tampil['Service_Level_Achieved'].apply(lambda x: f"{x:.2%}")
                 
