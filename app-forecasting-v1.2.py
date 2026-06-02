@@ -46,7 +46,8 @@ def calculate_agents_erlang(cof, aht_seconds, max_wait_time):
 
 # --- FUNGSI CLEANSING HOLT-WINTERS ---
 def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_residual=15):
-    series = df[target_col].fillna(method='ffill').fillna(method='bfill')
+    # PERBAIKAN: Menggunakan .ffill() dan .bfill() untuk kompatibilitas Pandas versi terbaru
+    series = df[target_col].ffill().bfill()
     
     model = ExponentialSmoothing(series, trend='add', seasonal='add', seasonal_periods=seasonal_periods, initialization_method="estimated")
     hw_fit = model.fit()
@@ -55,6 +56,7 @@ def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_resi
     residuals = np.abs(series - fitted_values)
     std_dev = np.std(residuals)
     
+    # Anomali: melebihi threshold standar deviasi DAN selisih fluktuasinya lebih dari min_residual
     is_anomaly = (residuals > (threshold * std_dev)) & (residuals > min_residual)
     
     cleansed_series = series.copy()
@@ -69,6 +71,7 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
         'y': df_hist[f'{target_col}_cleansed']
     })
     
+    # Mencegah error pada mode multiplikatif jika ada nilai 0 mutlak
     df_prophet['y'] = df_prophet['y'].replace(0, 0.01)
     
     holidays_list = []
@@ -84,7 +87,6 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
                 'upper_window': 0
             })
             holidays_list.append(h_df)
-            # Simpan tanggal libur dalam bentuk list (tanpa jam) untuk pengecekan payday
             holiday_dates = pd.to_datetime(df_holidays['Tanggal']).dt.normalize().tolist()
             
     # 2. Masukkan Logika Payday Otomatis
@@ -92,7 +94,6 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
         start_date = df_prophet['ds'].min()
         end_date = pd.to_datetime(end_fcst)
         
-        # Ambil semua bulan dari awal histori sampai akhir forecast
         dr = pd.date_range(start=start_date, end=end_date)
         months = dr.to_period('M').unique()
         
@@ -102,9 +103,8 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
             dt_1 = pd.Timestamp(year=m.year, month=m.month, day=1)
             paydays.append(dt_1)
             
-            # Tanggal 25
+            # Tanggal 25 (Digeser jika Sabtu, Minggu, atau Hari Libur Nasional)
             dt_25 = pd.Timestamp(year=m.year, month=m.month, day=25)
-            # LOGIKA: Jika sabtu (5), minggu (6), atau hari libur -> dimajukan 1 hari
             while dt_25.weekday() >= 5 or dt_25 in holiday_dates:
                 dt_25 -= pd.Timedelta(days=1)
             paydays.append(dt_25)
@@ -117,7 +117,6 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
         })
         holidays_list.append(p_df)
         
-    # Gabungkan semua hari libur dan payday menjadi satu DataFrame untuk Prophet
     final_holidays = pd.concat(holidays_list, ignore_index=True) if holidays_list else None
         
     model = Prophet(holidays=final_holidays, daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, seasonality_mode='multiplicative')
@@ -147,6 +146,7 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
 
 # --- UI SIDEBAR ---
 st.sidebar.header("📂 1. Upload Database")
+st.sidebar.markdown("*(Pastikan ada kolom **Datetime** untuk Interval & **Tanggal** untuk Hari Libur)*")
 file_cof = st.sidebar.file_uploader("Upload Data COF (Interval 30 Min)", type=['csv', 'xlsx'])
 file_aht = st.sidebar.file_uploader("Upload Data AHT (Interval 30 Min)", type=['csv', 'xlsx'])
 file_holidays = st.sidebar.file_uploader("Upload Data Libur Nasional (Opsional)", type=['csv', 'xlsx'])
@@ -166,8 +166,7 @@ st.sidebar.markdown("**Target Forecast**")
 start_forecast = st.sidebar.date_input("Mulai Forecast", pd.to_datetime('2026-06-01'))
 end_forecast = st.sidebar.date_input("Akhir Forecast", pd.to_datetime('2026-06-30'))
 
-# CHECKBOX BARU UNTUK FITUR PAYDAY OTOMATIS
-use_payday = st.sidebar.checkbox("💰 Aktifkan Auto-Payday (Tgl 1 & 25)", value=True, help="Menandai otomatis tgl 1 & 25 sbg payday. Jika tgl 25 libur/weekend, mundur ke hari kerja sebelumnya.")
+use_payday = st.sidebar.checkbox("💰 Aktifkan Auto-Payday (Tgl 1 & 25)", value=True, help="Menandai otomatis tgl 1 & 25 sbg payday. Jika libur/weekend, mundur ke hari kerja sebelumnya.")
 
 # --- PROSES UTAMA ---
 if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
@@ -190,7 +189,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
             
-            # Forecasting dengan melempar variabel use_payday
+            # Forecasting
             forecast_cof, mape_cof = run_prophet(df_cof, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
             forecast_aht, mape_aht = run_prophet(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
             
