@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import math
-import datetime
-import io
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.metrics import mean_absolute_percentage_error
@@ -14,218 +12,198 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="WFM Forecast & Capacity Planner", layout="wide")
 st.title("WFM Forecast & Capacity Planning Tool")
 
-# --- FUNGSI ERLANG C & SERVICE LEVEL ---
-def erlang_c_calculations(agents, traffic, aht, target_time):
+# --- FUNGSI ERLANG C ITERATIF (Mencegah Error Factorial) ---
+def erlang_c_prob(agents, traffic):
     if agents <= traffic:
-        return 1.0, float('inf'), 0.0 
-    
+        return 1.0
     erlang_b_inv = 1.0
     for i in range(1, int(agents) + 1):
         erlang_b_inv = 1.0 + erlang_b_inv * i / traffic
     erlang_b = 1.0 / erlang_b_inv
-    
-    pw = erlang_b / (1.0 - (traffic / agents) * (1.0 - erlang_b))
-    pw = max(0.0, min(1.0, pw))
-    
-    asa = pw * (aht / (agents - traffic))
-    sl = 1 - (pw * math.exp(-(agents - traffic) * (target_time / aht)))
-    sl = max(0.0, min(1.0, sl))
-    
-    return pw, asa, sl
+    erlang_c = erlang_b / (1.0 - (traffic / agents) * (1.0 - erlang_b))
+    return max(0.0, min(1.0, erlang_c))
 
-def find_required_agents(cof, aht_seconds, target_sl, target_time):
+def calculate_agents_erlang(cof, aht_seconds, max_wait_time):
     if pd.isna(cof) or pd.isna(aht_seconds) or cof <= 0:
-        return 0, 0.0, 0.0
+        return 0, 0.0
     
-    interval_seconds = 1800 
+    interval_seconds = 1800 # 30 menit
     traffic = (cof * aht_seconds) / interval_seconds
-    agents = math.ceil(traffic) + 1
+    agents = math.ceil(traffic)
     
     while True:
-        _, asa, sl = erlang_c_calculations(agents, traffic, aht_seconds, target_time)
-        if sl >= target_sl:
+        prob_wait = erlang_c_prob(agents, traffic)
+        # Average Speed of Answer (ASA)
+        if agents > traffic:
+            asa = prob_wait * (aht_seconds / (agents - traffic))
+        else:
+            asa = float('inf')
+            
+        if asa <= max_wait_time:
             break
         agents += 1
-        if agents > 1000: break
-            
-    return agents, asa, sl
+        
+    return agents, asa
 
-# --- FUNGSI CLEANSING HOLT-WINTERS ---
-def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0):
-    series = df[target_col].ffill().bfill()
-    if len(series) < (2 * seasonal_periods):
-        return series, pd.Series([False] * len(series), index=series.index)
+# --- FUNGSI CLEANSING HOLT-WINTERS (Diperbarui) ---
+# Penambahan min_residual agar deviasi angka kecil di jam malam tidak terpotong cleansing
+def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_residual=15):
+    series = df[target_col].fillna(method='ffill').fillna(method='bfill')
     
-    try:
-        model = ExponentialSmoothing(series, trend='add', seasonal='add', seasonal_periods=seasonal_periods, initialization_method="estimated")
-        hw_fit = model.fit()
-        fitted_values = hw_fit.fittedvalues
-        residuals = np.abs(series - fitted_values)
-        std_dev = np.std(residuals)
-        if std_dev == 0: return series, pd.Series([False] * len(series), index=series.index)
-        is_anomaly = residuals > (threshold * std_dev)
-        cleansed_series = series.copy()
-        cleansed_series[is_anomaly] = fitted_values[is_anomaly]
-        return cleansed_series, is_anomaly
-    except:
-        return series, pd.Series([False] * len(series), index=series.index)
+    model = ExponentialSmoothing(series, trend='add', seasonal='add', seasonal_periods=seasonal_periods, initialization_method="estimated")
+    hw_fit = model.fit()
+    fitted_values = hw_fit.fittedvalues
+    
+    residuals = np.abs(series - fitted_values)
+    std_dev = np.std(residuals)
+    
+    # PERBAIKAN: Anomali harus lebih dari sekian Standar Deviasi DAN nilainya bergeser > min_residual
+    is_anomaly = (residuals > (threshold * std_dev)) & (residuals > min_residual)
+    
+    cleansed_series = series.copy()
+    cleansed_series[is_anomaly] = fitted_values[is_anomaly]
+    
+    return cleansed_series, is_anomaly
 
-# --- FUNGSI FORECAST PROPHET ---
-def run_prophet(df_hist, df_payday, df_holiday, target_col, start_fcst, end_fcst): 
-    df_prophet = pd.DataFrame({'ds': df_hist['Datetime'], 'y': df_hist[f'{target_col}_cleansed']})
-    holidays_list = []
+# --- FUNGSI FORECAST PROPHET (Diperbarui) ---
+def run_prophet(df_hist, df_payday, target_col, periods=1440): # 1440 = 30 hari x 48 interval
+    # Siapkan data untuk Prophet
+    df_prophet = pd.DataFrame({
+        'ds': df_hist['Datetime'],
+        'y': df_hist[f'{target_col}_cleansed']
+    })
+    
+    # PERBAIKAN: Mode Multiplikatif tidak bisa menerima angka 0 mutlak, kita ubah 0 jadi 0.01 (sangat kecil)
+    df_prophet['y'] = df_prophet['y'].replace(0, 0.01)
+    
+    # Siapkan Holidays (Pay Day)
+    holidays = None
     if df_payday is not None and not df_payday.empty:
-        holidays_list.append(pd.DataFrame({'holiday': 'payday', 'ds': pd.to_datetime(df_payday['Date']), 'lower_window': 0, 'upper_window': 0}))
-    if df_holiday is not None and not df_holiday.empty:
-        holidays_list.append(pd.DataFrame({'holiday': 'national_holiday', 'ds': pd.to_datetime(df_holiday['Date']), 'lower_window': 0, 'upper_window': 0}))
-    holidays = pd.concat(holidays_list, ignore_index=True) if holidays_list else None
-    
-    model = Prophet(holidays=holidays, daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
+        holidays = pd.DataFrame({
+            'holiday': 'payday',
+            'ds': pd.to_datetime(df_payday['Date']),
+            'lower_window': 0,
+            'upper_window': 0
+        })
+        
+    # PERBAIKAN: Tambahkan seasonality_mode='multiplicative'
+    model = Prophet(
+        holidays=holidays, 
+        daily_seasonality=True, 
+        weekly_seasonality=True, 
+        yearly_seasonality=False,
+        seasonality_mode='multiplicative'
+    )
     model.fit(df_prophet)
     
-    historical_pred = model.predict(df_prophet[['ds']])
-    mape = mean_absolute_percentage_error(df_prophet['y'], historical_pred['yhat']) * 100
+    future = model.make_future_dataframe(periods=periods, freq='30T')
+    forecast = model.predict(future)
     
-    end_fcst_dt = pd.to_datetime(end_fcst) + pd.Timedelta(hours=23, minutes=30)
-    future_dates = pd.date_range(start=pd.to_datetime(start_fcst), end=end_fcst_dt, freq='30min')
-    forecast = model.predict(pd.DataFrame({'ds': future_dates}))
+    # Hitung MAPE di data historis (Fitted vs Actual)
+    historical_forecast = forecast.iloc[:len(df_prophet)]
+    mape = mean_absolute_percentage_error(df_prophet['y'], historical_forecast['yhat']) * 100
     
-    future_forecast = forecast[['ds', 'yhat']].copy()
+    # Ambil hanya nilai masa depan
+    future_forecast = forecast.iloc[len(df_prophet):][['ds', 'yhat']]
     future_forecast.rename(columns={'ds': 'Datetime', 'yhat': f'{target_col}_forecast'}, inplace=True)
-    future_forecast[f'{target_col}_forecast'] = future_forecast[f'{target_col}_forecast'].clip(lower=0) 
+    future_forecast[f'{target_col}_forecast'] = future_forecast[f'{target_col}_forecast'].clip(lower=0) # Hindari nilai minus
+    
     return future_forecast, mape
 
 # --- UI SIDEBAR ---
 st.sidebar.header("1. Upload Database")
+st.sidebar.markdown("*(Pastikan ada kolom **Datetime** untuk data Interval dan **Date** untuk Pay Day)*")
 file_cof = st.sidebar.file_uploader("Upload Data COF (Interval 30 Min)", type=['csv', 'xlsx'])
 file_aht = st.sidebar.file_uploader("Upload Data AHT (Interval 30 Min)", type=['csv', 'xlsx'])
-file_payday = st.sidebar.file_uploader("Upload Data Pay Day (Opsional)", type=['csv', 'xlsx'])
-file_holiday = st.sidebar.file_uploader("Upload Data Libur Nasional (Opsional)", type=['csv', 'xlsx'])
+file_payday = st.sidebar.file_uploader("Upload Data Pay Day", type=['csv', 'xlsx'])
 
-st.sidebar.header("2. Konfigurasi Tanggal")
-start_history_date = st.sidebar.date_input("Mulai Data Historis", datetime.date(2025, 12, 1))
-end_history_date = st.sidebar.date_input("Akhir Data Historis", datetime.date(2026, 2, 28))
-start_forecast_date = st.sidebar.date_input("Mulai Forecast", datetime.date(2026, 3, 1))
-end_forecast_date = st.sidebar.date_input("Akhir Forecast", datetime.date(2026, 3, 31))
-
-st.sidebar.header("3. Target & Parameter WFM")
-target_sl_pct = st.sidebar.slider("Target Service Level (%)", 50, 100, 80) / 100
-target_asa_sec = st.sidebar.number_input("Target ASA / Threshold (Detik)", value=20)
-shrinkage = st.sidebar.number_input("Shrinkage (%)", value=30.0) / 100
+st.sidebar.header("2. Konfigurasi Erlang C")
+shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
+max_wait_time = st.sidebar.number_input("Max Waiting Time (Detik)", value=20)
 work_hours = st.sidebar.number_input("Jam Kerja per Hari", value=8)
 work_days = st.sidebar.number_input("Hari Kerja per Bulan", value=22)
-
-forecast_days = (end_forecast_date - start_forecast_date).days + 1
+forecast_days = st.sidebar.number_input("Target Hari Forecast", value=30, min_value=1)
 
 # --- PROSES UTAMA ---
 if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
     if file_cof and file_aht:
-        with st.spinner("Sedang memproses data..."):
+        with st.spinner("Memproses data, mohon tunggu..."):
+            # 1. Baca Data
             df_cof = pd.read_csv(file_cof) if file_cof.name.endswith('csv') else pd.read_excel(file_cof)
             df_aht = pd.read_csv(file_aht) if file_aht.name.endswith('csv') else pd.read_excel(file_aht)
-            df_payday = pd.read_csv(file_payday) if (file_payday and file_payday.name.endswith('csv')) else pd.read_excel(file_payday) if file_payday else None
-            df_holiday = pd.read_csv(file_holiday) if (file_holiday and file_holiday.name.endswith('csv')) else pd.read_excel(file_holiday) if file_holiday else None
+            
+            df_payday = None
+            if file_payday:
+                df_payday = pd.read_csv(file_payday) if file_payday.name.endswith('csv') else pd.read_excel(file_payday)
             
             df_cof['Datetime'] = pd.to_datetime(df_cof['Datetime'])
             df_aht['Datetime'] = pd.to_datetime(df_aht['Datetime'])
             
-            start_hist_dt = pd.to_datetime(start_history_date)
-            end_hist_dt = pd.to_datetime(end_history_date) + pd.Timedelta(hours=23, minutes=59)
+            # 2. Cleansing Data
+            # Note: min_residual=15 untuk COF artinya fluktuasi di bawah 15 telepon tidak akan dipotong
+            # min_residual=50 untuk AHT artinya fluktuasi AHT di bawah 50 detik tidak akan dipotong
+            df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
+            df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
             
-            df_cof = df_cof[(df_cof['Datetime'] >= start_hist_dt) & (df_cof['Datetime'] <= end_hist_dt)]
-            df_aht = df_aht[(df_aht['Datetime'] >= start_hist_dt) & (df_aht['Datetime'] <= end_hist_dt)]
+            # 3. Forecasting Prophet
+            intervals_to_forecast = forecast_days * 48
+            forecast_cof, mape_cof = run_prophet(df_cof, df_payday, 'COF', intervals_to_forecast)
+            forecast_aht, mape_aht = run_prophet(df_aht, df_payday, 'AHT', intervals_to_forecast)
             
-            if df_cof.empty:
-                st.error("Data Historis kosong pada rentang tanggal tersebut.")
-            else:
-                df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF')
-                df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT')
+            # Gabungkan Hasil Forecast
+            df_result = pd.merge(forecast_cof, forecast_aht, on='Datetime')
+            
+            # 4. Kalkulasi Erlang C per Interval
+            df_result['Base_Agent_Needed'] = 0
+            df_result['Projected_Wait_Time'] = 0.0
+            
+            for index, row in df_result.iterrows():
+                agents, wait_time = calculate_agents_erlang(row['COF_forecast'], row['AHT_forecast'], max_wait_time)
+                df_result.at[index, 'Base_Agent_Needed'] = agents
+                df_result.at[index, 'Projected_Wait_Time'] = wait_time
                 
-                fcst_cof, mape_cof = run_prophet(df_cof, df_payday, df_holiday, 'COF', start_forecast_date, end_forecast_date)
-                fcst_aht, mape_aht = run_prophet(df_aht, df_payday, df_holiday, 'AHT', start_forecast_date, end_forecast_date)
-                
-                df_res = pd.merge(fcst_cof, fcst_aht, on='Datetime')
-                
-                # Kalkulasi Erlang C
-                df_res['Base_Agent_Needed'] = 0
-                df_res['Projected_SL'] = 0.0
-                
-                for index, row in df_res.iterrows():
-                    agents, _, sl = find_required_agents(row['COF_forecast'], row['AHT_forecast'], target_sl_pct, target_asa_sec)
-                    df_res.at[index, 'Base_Agent_Needed'] = agents
-                    df_res.at[index, 'Projected_SL'] = sl
-                    
-                df_res['Agent_Needed_Adjust'] = np.ceil(df_res['Base_Agent_Needed'] / (1 - shrinkage))
-                
-                # --- UPDATE LOGIKA FTE & WORKSTATION ---
-                df_res['DateOnly'] = df_res['Datetime'].dt.date
-                
-                # 1. Kebutuhan Workstation (Nilai Peak tertinggi dari Agent_With_Shrinkage)
-                max_workstation = int(df_res['Agent_Needed_Adjust'].max())
-                
-                # 2. Kalkulasi Headcount Harian (Metode FTE)
-                # Jumlahkan seluruh slot interval per hari, lalu bagi kapasitas agen (jam kerja x 2)
-                daily_slots = df_res.groupby('DateOnly')['Agent_Needed_Adjust'].sum()
-                daily_headcount = np.ceil(daily_slots / (work_hours * 2))
-                
-                # 3. Kalkulasi Headcount Bulanan
-                # Jumlahkan seluruh kebutuhan harian, lalu bagi dengan hari kerja sebulan
-                total_monthly_headcount = math.ceil(daily_headcount.sum() / work_days)
-                
-                # Menyiapkan Dataframe Final
-                df_final = pd.DataFrame({
-                    'Date': df_res['Datetime'].dt.date,
-                    'Interval': df_res['Datetime'].dt.strftime('%H:%M'),
-                    'COF_Forecast': df_res['COF_forecast'].round(0).astype(int),
-                    'AHT_Forecast': df_res['AHT_forecast'].round(2),
-                    'Base_Agent_Erlang': df_res['Base_Agent_Needed'].astype(int),
-                    'Agent_With_Shrinkage': df_res['Agent_Needed_Adjust'].astype(int),
-                    'Projected_SL_Pct': (df_res['Projected_SL'] * 100).round(2)
-                })
+            # Hitung Agent Adjusted (Dengan Shrinkage)
+            df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
+            
+            # Kalkulasi Headcount Bulanan
+            # Ambil puncak maksimum agen dalam satu hari untuk menentukan headcount
+            df_result['Date'] = df_result['Datetime'].dt.date
+            max_agents_per_day = df_result.groupby('Date')['Agent_Needed_Adjust'].max()
+            avg_daily_headcount_needed = max_agents_per_day.mean()
+            
+            # Asumsi: Agent bekerja bergantian. Total headcount = (Kebutuhan shift puncak harian * 30 hari) / Hari kerja agen
+            total_monthly_headcount = math.ceil((avg_daily_headcount_needed * forecast_days) / work_days)
 
-                st.success(f"Kalkulasi Selesai untuk {forecast_days} hari!")
+            # --- TAMPILAN HASIL (UI) ---
+            st.success("Proses Selesai!")
+            
+            tab1, tab2, tab3 = st.tabs(["📊 Forecast & Cleansing", "🎯 Akurasi (MAPE)", "👥 Kebutuhan Agent"])
+            
+            with tab1:
+                st.subheader("Prediksi COF (Call Offered)")
+                st.line_chart(df_result.set_index('Datetime')['COF_forecast'])
+                st.subheader("Prediksi AHT (Average Handle Time)")
+                st.line_chart(df_result.set_index('Datetime')['AHT_forecast'])
                 
-                tab1, tab2, tab3 = st.tabs(["📊 Visualisasi Forecast", "🎯 Akurasi (MAPE)", "👥 Kapasitas Agent"])
+            with tab2:
+                col1, col2 = st.columns(2)
+                col1.metric(label="MAPE COF (Historical Fit)", value=f"{mape_cof:.2f}%")
+                col2.metric(label="MAPE AHT (Historical Fit)", value=f"{mape_aht:.2f}%")
+                if mape_cof > 15 or mape_aht > 15:
+                    st.warning("⚠️ Nilai MAPE di atas 15%. Pertimbangkan untuk menambah data historis atau tuning parameter model.")
+                else:
+                    st.success("✅ Akurasi model dalam batas yang sangat baik.")
+                    
+            with tab3:
+                st.subheader("Ringkasan Kapasitas (Kalkulasi Erlang C)")
                 
-                with tab1:
-                    st.subheader("Prediksi Volume & Durasi")
-                    st.line_chart(df_res.set_index('Datetime')['COF_forecast'])
-                    st.line_chart(df_res.set_index('Datetime')['AHT_forecast'])
-                    
-                with tab2:
-                    col_m1, col_m2 = st.columns(2)
-                    col_m1.metric("MAPE COF", f"{mape_cof:.2f}%")
-                    col_m2.metric("MAPE AHT", f"{mape_aht:.2f}%")
-                    
-                    if mape_cof > 15 or mape_aht > 15:
-                        st.warning("⚠️ Nilai MAPE di atas 15%. Disarankan untuk merevisi parameter peramalan (Prophet) atau rentang data historis.")
-                    else:
-                        st.success("✅ Akurasi model dalam batas yang sangat baik.")
-                        
-                with tab3:
-                    st.subheader("Ringkasan Kapasitas Agent & Fasilitas")
-                    
-                    # Metrik Ringkasan yang Diperbarui
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Total COF Forecast", f"{int(df_res['COF_forecast'].sum()):,}")
-                    c2.metric("Kebutuhan Workstation (WS)", max_workstation)
-                    c3.metric("Avg Projected SL", f"{(df_res['Projected_SL'].mean() * 100):.2f}%")
-                    c4.metric("Headcount Bulanan (FTE)", int(total_monthly_headcount))
-
-                    st.write("**Tabel Detail Kebutuhan Agent per Interval**")
-                    st.dataframe(df_final, use_container_width=True)
-                    
-                    # --- DOWNLOAD XLSX ---
-                    buffer = io.BytesIO()
-                    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                        df_final.to_excel(writer, index=False, sheet_name='WFM_Capacity_Plan')
-                    
-                    st.download_button(
-                        label="📥 Download Hasil Kalkulasi (.xlsx)",
-                        data=buffer.getvalue(),
-                        file_name=f"WFM_Plan_{start_forecast_date}_to_{end_forecast_date}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Max Kebutuhan Agent per Interval", int(df_result['Agent_Needed_Adjust'].max()))
+                c2.metric("Rata-rata Wait Time Proyeksi (Detik)", f"{df_result['Projected_Wait_Time'].mean():.2f}")
+                c3.metric("Estimasi Total Headcount Bulanan", total_monthly_headcount)
+                
+                st.write("**Detail Interval Forecast & Agent**")
+                st.dataframe(df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Projected_Wait_Time', 'Agent_Needed_Adjust']], use_container_width=True)
 
     else:
-        st.error("Mohon unggah file database terlebih dahulu di sidebar.")
+        st.error("Mohon unggah file COF dan AHT terlebih dahulu.")
