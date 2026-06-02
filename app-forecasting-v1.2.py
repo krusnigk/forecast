@@ -23,30 +23,37 @@ def erlang_c_prob(agents, traffic):
     erlang_c = erlang_b / (1.0 - (traffic / agents) * (1.0 - erlang_b))
     return max(0.0, min(1.0, erlang_c))
 
-def calculate_agents_erlang(cof, aht_seconds, max_wait_time):
+# PERBAIKAN: Fungsi Erlang C sekarang menghitung Service Level (SL)
+def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time):
     if pd.isna(cof) or pd.isna(aht_seconds) or cof <= 0:
-        return 0, 0.0
+        return 0, 0.0, 1.0
     
     interval_seconds = 1800 # 30 menit
     traffic = (cof * aht_seconds) / interval_seconds
     agents = math.ceil(traffic)
+    if agents == 0:
+        agents = 1
     
     while True:
         prob_wait = erlang_c_prob(agents, traffic)
         if agents > traffic:
+            # Hitung ASA (Average Speed of Answer)
             asa = prob_wait * (aht_seconds / (agents - traffic))
+            # Hitung persentase Service Level (SL)
+            sl = 1 - (prob_wait * math.exp(-(agents - traffic) * max_wait_time / aht_seconds))
         else:
             asa = float('inf')
+            sl = 0.0
             
-        if asa <= max_wait_time:
+        # Berhenti menambah agen jika SL sudah mencapai atau melebihi target SL (misal: 90%)
+        if sl >= target_sl:
             break
         agents += 1
         
-    return agents, asa
+    return agents, asa, sl
 
 # --- FUNGSI CLEANSING HOLT-WINTERS ---
 def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_residual=15):
-    # PERBAIKAN: Menggunakan .ffill() dan .bfill() untuk kompatibilitas Pandas versi terbaru
     series = df[target_col].ffill().bfill()
     
     model = ExponentialSmoothing(series, trend='add', seasonal='add', seasonal_periods=seasonal_periods, initialization_method="estimated")
@@ -56,7 +63,6 @@ def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_resi
     residuals = np.abs(series - fitted_values)
     std_dev = np.std(residuals)
     
-    # Anomali: melebihi threshold standar deviasi DAN selisih fluktuasinya lebih dari min_residual
     is_anomaly = (residuals > (threshold * std_dev)) & (residuals > min_residual)
     
     cleansed_series = series.copy()
@@ -71,13 +77,11 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
         'y': df_hist[f'{target_col}_cleansed']
     })
     
-    # Mencegah error pada mode multiplikatif jika ada nilai 0 mutlak
     df_prophet['y'] = df_prophet['y'].replace(0, 0.01)
     
     holidays_list = []
     holiday_dates = []
     
-    # 1. Masukkan Hari Libur Nasional
     if df_holidays is not None and not df_holidays.empty:
         if 'Tanggal' in df_holidays.columns:
             h_df = pd.DataFrame({
@@ -89,7 +93,6 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
             holidays_list.append(h_df)
             holiday_dates = pd.to_datetime(df_holidays['Tanggal']).dt.normalize().tolist()
             
-    # 2. Masukkan Logika Payday Otomatis
     if use_auto_payday:
         start_date = df_prophet['ds'].min()
         end_date = pd.to_datetime(end_fcst)
@@ -99,11 +102,9 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
         
         paydays = []
         for m in months:
-            # Tanggal 1
             dt_1 = pd.Timestamp(year=m.year, month=m.month, day=1)
             paydays.append(dt_1)
             
-            # Tanggal 25 (Digeser jika Sabtu, Minggu, atau Hari Libur Nasional)
             dt_25 = pd.Timestamp(year=m.year, month=m.month, day=25)
             while dt_25.weekday() >= 5 or dt_25 in holiday_dates:
                 dt_25 -= pd.Timedelta(days=1)
@@ -152,8 +153,10 @@ file_aht = st.sidebar.file_uploader("Upload Data AHT (Interval 30 Min)", type=['
 file_holidays = st.sidebar.file_uploader("Upload Data Libur Nasional (Opsional)", type=['csv', 'xlsx'])
 
 st.sidebar.header("⚙️ 2. Konfigurasi Erlang C")
+# PERBAIKAN: Menambahkan kembali Target SL di Sidebar
+target_sl = st.sidebar.slider("Target Service Level (%)", min_value=50, max_value=100, value=90) / 100
+max_wait_time = st.sidebar.number_input("Target ASA / Max Wait Time (Detik)", value=20, help="Target waktu angkat telepon")
 shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
-max_wait_time = st.sidebar.number_input("Max Waiting Time (Detik)", value=20)
 work_hours = st.sidebar.number_input("Jam Kerja per Hari", value=8)
 work_days = st.sidebar.number_input("Hari Kerja/Agen/Bulan", value=22)
 
@@ -195,14 +198,17 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
             df_result = pd.merge(forecast_cof, forecast_aht, on='Datetime')
             
-            # Erlang C Kalkulasi
+            # Erlang C Kalkulasi dengan Target SL
             df_result['Base_Agent_Needed'] = 0
             df_result['Projected_Wait_Time'] = 0.0
+            df_result['Service_Level_Achieved'] = 0.0
             
             for index, row in df_result.iterrows():
-                agents, wait_time = calculate_agents_erlang(row['COF_forecast'], row['AHT_forecast'], max_wait_time)
+                # PERBAIKAN: Memasukkan parameter target_sl
+                agents, wait_time, sl_achieved = calculate_agents_erlang(row['COF_forecast'], row['AHT_forecast'], target_sl, max_wait_time)
                 df_result.at[index, 'Base_Agent_Needed'] = agents
                 df_result.at[index, 'Projected_Wait_Time'] = wait_time
+                df_result.at[index, 'Service_Level_Achieved'] = sl_achieved
                 
             df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
             
@@ -236,13 +242,19 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             with tab3:
                 st.subheader("Ringkasan Kapasitas (Kalkulasi Erlang C)")
                 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Max Kebutuhan Agent per Interval", int(df_result['Agent_Needed_Adjust'].max()))
-                c2.metric("Rata-rata Wait Time Proyeksi (Detik)", f"{df_result['Projected_Wait_Time'].mean():.2f}")
-                c3.metric("Estimasi Total Headcount Bulanan", total_monthly_headcount)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Max Agent per Interval", int(df_result['Agent_Needed_Adjust'].max()))
+                c2.metric("Target SL", f"{target_sl*100}% dalam {max_wait_time}s")
+                c3.metric("Rata-rata Wait Time Proyeksi", f"{df_result['Projected_Wait_Time'].mean():.2f} s")
+                c4.metric("Total Headcount Bulanan", total_monthly_headcount)
                 
                 st.write("**Detail Interval Forecast & Agent**")
-                st.dataframe(df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Projected_Wait_Time', 'Agent_Needed_Adjust']], use_container_width=True)
+                
+                # Format SL menjadi persentase agar mudah dibaca di tabel
+                tabel_tampil = df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Service_Level_Achieved', 'Projected_Wait_Time']].copy()
+                tabel_tampil['Service_Level_Achieved'] = tabel_tampil['Service_Level_Achieved'].apply(lambda x: f"{x:.2%}")
+                
+                st.dataframe(tabel_tampil, use_container_width=True)
 
     else:
         st.error("Mohon unggah file COF dan AHT terlebih dahulu.")
