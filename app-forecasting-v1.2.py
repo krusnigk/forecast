@@ -5,7 +5,6 @@ import math
 import io
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from sklearn.metrics import mean_absolute_percentage_error
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -132,15 +131,12 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
     future = model.make_future_dataframe(periods=periods, freq='30min', include_history=True)
     forecast = model.predict(future)
     
-    historical_forecast = forecast.iloc[:len(df_prophet)]
-    mape = mean_absolute_percentage_error(df_prophet['y'], historical_forecast['yhat']) * 100
-    
     start_fcst_dt = pd.to_datetime(start_fcst)
     future_forecast = forecast[(forecast['ds'] >= start_fcst_dt) & (forecast['ds'] <= end_fcst_dt)][['ds', 'yhat']]
     future_forecast.rename(columns={'ds': 'Datetime', 'yhat': f'{target_col}_forecast'}, inplace=True)
     future_forecast[f'{target_col}_forecast'] = future_forecast[f'{target_col}_forecast'].clip(lower=0)
     
-    return future_forecast, mape
+    return future_forecast
 
 # --- UI SIDEBAR ---
 st.sidebar.header("📂 1. Upload Database")
@@ -152,7 +148,7 @@ st.sidebar.header("⚙️ 2. Konfigurasi Erlang C")
 target_sl = st.sidebar.slider("Target Service Level (%)", min_value=50, max_value=100, value=90) / 100
 max_wait_time = st.sidebar.number_input("Target ASA / Max Wait Time (Detik)", value=20)
 shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
-work_hours = st.sidebar.number_input("Jam Kerja per Hari", value=8)
+work_hours = st.sidebar.number_input("Jam Kerja per Hari (Untuk FTE)", value=8)
 work_days = st.sidebar.number_input("Hari Kerja/Agen/Bulan", value=22)
 
 st.sidebar.header("📅 3. Konfigurasi Tanggal")
@@ -185,10 +181,13 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
             
             # Forecasting
-            forecast_cof, mape_cof = run_prophet(df_cof, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
-            forecast_aht, mape_aht = run_prophet(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
+            forecast_cof = run_prophet(df_cof, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
+            forecast_aht = run_prophet(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
             
             df_result = pd.merge(forecast_cof, forecast_aht, on='Datetime')
+            
+            # --- UPDATE 1: PEMBULATAN COF KE ATAS ---
+            df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
             # Erlang C Kalkulasi
             df_result['Base_Agent_Needed'] = 0
@@ -204,14 +203,20 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
             df_result['Date'] = df_result['Datetime'].dt.date
             
-            # AGREGASI BULANAN
+            # --- UPDATE 2: AGREGASI BULANAN (WORKLOAD FTE) ---
             total_cof_bulan = df_result['COF_forecast'].sum()
             avg_aht_bulan = df_result['AHT_forecast'].mean()
             avg_sl_bulan = df_result['Service_Level_Achieved'].mean()
-            kebutuhan_ws_bulan = df_result['Agent_Needed_Adjust'].max() # Peak concurrency
             
-            max_agents_per_day = df_result.groupby('Date')['Agent_Needed_Adjust'].max()
-            avg_daily_headcount_needed = max_agents_per_day.mean()
+            # 2.A: Kebutuhan Workstation (Peak)
+            kebutuhan_ws_bulan = df_result['Agent_Needed_Adjust'].max() 
+            
+            # 2.B: Kebutuhan Headcount Manusia (Workload)
+            # 1 interval 30 menit = 0.5 jam kerja
+            df_daily_workload_hours = df_result.groupby('Date')['Agent_Needed_Adjust'].sum() * 0.5
+            daily_headcount_needed = np.ceil(df_daily_workload_hours / work_hours)
+            
+            avg_daily_headcount_needed = daily_headcount_needed.mean()
             total_hari_forecast = (pd.to_datetime(end_forecast) - pd.to_datetime(start_forecast)).days + 1
             total_monthly_headcount = math.ceil((avg_daily_headcount_needed * total_hari_forecast) / work_days)
 
@@ -225,19 +230,17 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
 
             # Format untuk tampilan harian
             df_daily_display = df_daily.copy()
-            df_daily_display['Total_COF'] = df_daily_display['Total_COF'].apply(math.ceil)
+            df_daily_display['Total_COF'] = df_daily_display['Total_COF'].astype(int) # Sudah integer karena dibulatkan sebelumnya
             df_daily_display['Rata_Rata_AHT'] = df_daily_display['Rata_Rata_AHT'].apply(lambda x: f"{x:.0f} s")
             df_daily_display['Rata_Rata_SL'] = df_daily_display['Rata_Rata_SL'].apply(lambda x: f"{x:.2%}")
             df_daily_display['Max_Kebutuhan_Agent'] = df_daily_display['Max_Kebutuhan_Agent'].astype(int)
-            df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Kebutuhan Agent (Max)', 'Proyeksi SL']
+            df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
             # TAMPILAN UI
             st.success("Proses Selesai!")
             
-            # Pemisahan Tab
-            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            tab1, tab2, tab3, tab4 = st.tabs([
                 "📊 Forecast & Cleansing", 
-                "🎯 Akurasi (MAPE)", 
                 "👥 Kebutuhan Agent (Bulanan)", 
                 "📅 Hasil Harian",
                 "⏱️ Detail Interval"
@@ -250,39 +253,30 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 st.line_chart(df_result.set_index('Datetime')['AHT_forecast'])
                 
             with tab2:
-                col1, col2 = st.columns(2)
-                col1.metric(label="MAPE COF (Historical Fit)", value=f"{mape_cof:.2f}%")
-                col2.metric(label="MAPE AHT (Historical Fit)", value=f"{mape_aht:.2f}%")
-                if mape_cof > 15 or mape_aht > 15:
-                    st.warning("⚠️ Nilai MAPE di atas 15%.")
-                else:
-                    st.success("✅ Akurasi model dalam batas yang sangat baik.")
-                    
-            with tab3:
                 st.subheader("Ringkasan Kapasitas Bulanan")
-                st.markdown("Berdasarkan hasil forecasting dari awal hingga akhir bulan yang dipilih.")
+                st.markdown("Kalkulasi Agent sudah dipisahkan menggunakan metode Sizing by Workload (FTE).")
                 
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Total COF (1 Bulan)", f"{math.ceil(total_cof_bulan):,}")
+                c1.metric("Total COF (1 Bulan)", f"{total_cof_bulan:,}")
                 c2.metric("Rata-rata SL Projection", f"{avg_sl_bulan:.2%}")
                 c3.metric("Rata-rata AHT", f"{avg_aht_bulan:.0f} Detik")
                 
                 st.markdown("---")
                 c4, c5 = st.columns(2)
-                c4.metric("Kebutuhan Agent (Headcount)", total_monthly_headcount, help="Total agen yang harus direkrut/dijadwalkan dalam 1 bulan (memperhitungkan hari libur agen).")
-                c5.metric("Kebutuhan Workstation (WS)", int(kebutuhan_ws_bulan), help="Jumlah meja/PC maksimum yang dibutuhkan untuk menampung agen yang login di jam tersibuk.")
+                c4.metric("Total Headcount Manusia (FTE)", total_monthly_headcount, help=f"Total agen yang harus direkrut dalam 1 bulan (Asumsi 1 agen = {work_hours} jam kerja/hari & {work_days} hari/bulan).")
+                c5.metric("Kebutuhan Lisensi/PC Maksimal", int(kebutuhan_ws_bulan), help="Peak concurrency: Jumlah kursi terbanyak yang dibutuhkan dalam satu waktu.")
                 
-            with tab4:
+            with tab3:
                 st.subheader("Rincian Forecast per Hari")
                 st.dataframe(df_daily_display, use_container_width=True)
                 
-            with tab5:
+            with tab4:
                 st.subheader("Detail Kalkulasi per Interval (30 Menit)")
                 tabel_interval = df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Service_Level_Achieved', 'Projected_Wait_Time']].copy()
                 tabel_interval['Service_Level_Achieved'] = tabel_interval['Service_Level_Achieved'].apply(lambda x: f"{x:.2%}")
                 st.dataframe(tabel_interval, use_container_width=True)
 
-            # Tombol Download Excel (Menggabungkan Harian dan Interval)
+            # Tombol Download Excel
             st.write("---")
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
