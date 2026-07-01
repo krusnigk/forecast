@@ -5,6 +5,7 @@ import math
 import io
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from sklearn.metrics import mean_absolute_percentage_error
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -131,12 +132,16 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
     future = model.make_future_dataframe(periods=periods, freq='30min', include_history=True)
     forecast = model.predict(future)
     
+    # --- MAPE DIKEMBALIKAN KE SINI ---
+    historical_forecast = forecast.iloc[:len(df_prophet)]
+    mape = mean_absolute_percentage_error(df_prophet['y'], historical_forecast['yhat']) * 100
+    
     start_fcst_dt = pd.to_datetime(start_fcst)
     future_forecast = forecast[(forecast['ds'] >= start_fcst_dt) & (forecast['ds'] <= end_fcst_dt)][['ds', 'yhat']]
     future_forecast.rename(columns={'ds': 'Datetime', 'yhat': f'{target_col}_forecast'}, inplace=True)
     future_forecast[f'{target_col}_forecast'] = future_forecast[f'{target_col}_forecast'].clip(lower=0)
     
-    return future_forecast
+    return future_forecast, mape
 
 # --- UI SIDEBAR ---
 st.sidebar.header("📂 1. Upload Database")
@@ -180,13 +185,13 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
             
-            # Forecasting
-            forecast_cof = run_prophet(df_cof, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
-            forecast_aht = run_prophet(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
+            # Forecasting (Menangkap kembali mape_cof dan mape_aht)
+            forecast_cof, mape_cof = run_prophet(df_cof, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
+            forecast_aht, mape_aht = run_prophet(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
             
             df_result = pd.merge(forecast_cof, forecast_aht, on='Datetime')
             
-            # --- UPDATE 1: PEMBULATAN COF KE ATAS ---
+            # --- PEMBULATAN COF KE ATAS ---
             df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
             # Erlang C Kalkulasi
@@ -203,16 +208,15 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
             df_result['Date'] = df_result['Datetime'].dt.date
             
-            # --- UPDATE 2: AGREGASI BULANAN (WORKLOAD FTE) ---
+            # --- AGREGASI BULANAN (WORKLOAD FTE) ---
             total_cof_bulan = df_result['COF_forecast'].sum()
             avg_aht_bulan = df_result['AHT_forecast'].mean()
             avg_sl_bulan = df_result['Service_Level_Achieved'].mean()
             
-            # 2.A: Kebutuhan Workstation (Peak)
+            # Kebutuhan Workstation (Peak)
             kebutuhan_ws_bulan = df_result['Agent_Needed_Adjust'].max() 
             
-            # 2.B: Kebutuhan Headcount Manusia (Workload)
-            # 1 interval 30 menit = 0.5 jam kerja
+            # Kebutuhan Headcount Manusia (Workload)
             df_daily_workload_hours = df_result.groupby('Date')['Agent_Needed_Adjust'].sum() * 0.5
             daily_headcount_needed = np.ceil(df_daily_workload_hours / work_hours)
             
@@ -230,13 +234,13 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
 
             # Format untuk tampilan harian
             df_daily_display = df_daily.copy()
-            df_daily_display['Total_COF'] = df_daily_display['Total_COF'].astype(int) # Sudah integer karena dibulatkan sebelumnya
+            df_daily_display['Total_COF'] = df_daily_display['Total_COF'].astype(int) 
             df_daily_display['Rata_Rata_AHT'] = df_daily_display['Rata_Rata_AHT'].apply(lambda x: f"{x:.0f} s")
             df_daily_display['Rata_Rata_SL'] = df_daily_display['Rata_Rata_SL'].apply(lambda x: f"{x:.2%}")
             df_daily_display['Max_Kebutuhan_Agent'] = df_daily_display['Max_Kebutuhan_Agent'].astype(int)
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
-            # TAMPILAN UI
+            # TAMPILAN UI (Tanpa Metrik MAPE)
             st.success("Proses Selesai!")
             
             tab1, tab2, tab3, tab4 = st.tabs([
