@@ -132,7 +132,6 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
     future = model.make_future_dataframe(periods=periods, freq='30min', include_history=True)
     forecast = model.predict(future)
     
-    # --- MAPE DIKEMBALIKAN KE SINI ---
     historical_forecast = forecast.iloc[:len(df_prophet)]
     mape = mean_absolute_percentage_error(df_prophet['y'], historical_forecast['yhat']) * 100
     
@@ -185,13 +184,13 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
             
-            # Forecasting (Menangkap kembali mape_cof dan mape_aht)
+            # Forecasting
             forecast_cof, mape_cof = run_prophet(df_cof, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
             forecast_aht, mape_aht = run_prophet(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
             
             df_result = pd.merge(forecast_cof, forecast_aht, on='Datetime')
             
-            # --- PEMBULATAN COF KE ATAS ---
+            # Pembulatan COF
             df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
             # Erlang C Kalkulasi
@@ -208,7 +207,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
             df_result['Date'] = df_result['Datetime'].dt.date
             
-            # --- AGREGASI BULANAN (WORKLOAD FTE) ---
+            # --- AGREGASI KEBUTUHAN (WORKLOAD & PEAK) ---
             total_cof_bulan = df_result['COF_forecast'].sum()
             avg_aht_bulan = df_result['AHT_forecast'].mean()
             avg_sl_bulan = df_result['Service_Level_Achieved'].mean()
@@ -216,15 +215,16 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             # Kebutuhan Workstation (Peak)
             kebutuhan_ws_bulan = df_result['Agent_Needed_Adjust'].max() 
             
-            # Kebutuhan Headcount Manusia (Workload)
+            # Kebutuhan Headcount Harian Manusia (FTE)
             df_daily_workload_hours = df_result.groupby('Date')['Agent_Needed_Adjust'].sum() * 0.5
             daily_headcount_needed = np.ceil(df_daily_workload_hours / work_hours)
             
+            # Kebutuhan Headcount Bulanan
             avg_daily_headcount_needed = daily_headcount_needed.mean()
             total_hari_forecast = (pd.to_datetime(end_forecast) - pd.to_datetime(start_forecast)).days + 1
             total_monthly_headcount = math.ceil((avg_daily_headcount_needed * total_hari_forecast) / work_days)
 
-            # AGREGASI HARIAN
+            # --- AGREGASI HARIAN UNTUK TABEL ---
             df_daily = df_result.groupby('Date').agg(
                 Total_COF=('COF_forecast', 'sum'),
                 Rata_Rata_AHT=('AHT_forecast', 'mean'),
@@ -232,15 +232,22 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 Rata_Rata_SL=('Service_Level_Achieved', 'mean')
             ).reset_index()
 
-            # Format untuk tampilan harian
+            # Mapping nilai Headcount Harian (FTE) ke dalam tabel harian
+            df_daily['Headcount_Harian_FTE'] = df_daily['Date'].map(daily_headcount_needed)
+
+            # Format dan Atur Ulang Kolom untuk Tampilan
             df_daily_display = df_daily.copy()
             df_daily_display['Total_COF'] = df_daily_display['Total_COF'].astype(int) 
             df_daily_display['Rata_Rata_AHT'] = df_daily_display['Rata_Rata_AHT'].apply(lambda x: f"{x:.0f} s")
-            df_daily_display['Rata_Rata_SL'] = df_daily_display['Rata_Rata_SL'].apply(lambda x: f"{x:.2%}")
+            df_daily_display['Headcount_Harian_FTE'] = df_daily_display['Headcount_Harian_FTE'].astype(int) # Kolom Baru
             df_daily_display['Max_Kebutuhan_Agent'] = df_daily_display['Max_Kebutuhan_Agent'].astype(int)
-            df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
+            df_daily_display['Rata_Rata_SL'] = df_daily_display['Rata_Rata_SL'].apply(lambda x: f"{x:.2%}")
+            
+            # Menyusun urutan kolom sesuai permintaan (Headcount Harian diselipkan sebelum Peak)
+            df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL']]
+            df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
-            # TAMPILAN UI (Tanpa Metrik MAPE)
+            # TAMPILAN UI
             st.success("Proses Selesai!")
             
             tab1, tab2, tab3, tab4 = st.tabs([
