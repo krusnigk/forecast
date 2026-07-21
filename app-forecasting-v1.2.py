@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import math
 import io
-import pulp
 import datetime
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
@@ -24,73 +23,71 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI OPTIMASI SHIFT (PULP) DENGAN SOFT CONSTRAINTS (ANTI-INFEASIBLE) ---
+# --- FUNGSI ALOKASI SHIFT BERUNTUN (SEQUENTIAL GREEDY ALLOCATOR) ---
 @st.cache_data(show_spinner=False)
 def optimize_shift_distribution(df_result, master_shifts):
-    prob = pulp.LpProblem("Shift_Optimization", pulp.LpMinimize)
-    
-    first_date = df_result['Date'].min()
-    prev_date = first_date - pd.Timedelta(days=1)
-    unique_dates = [prev_date] + list(df_result['Date'].unique())
-    
-    shift_vars = {}
-    for d in unique_dates:
-        shift_vars[d] = {}
-        for s_code in master_shifts.keys():
-            var_name = f"X_{str(d).replace('-','')}_{str(s_code).replace('.','_')}"
-            # Tanpa batasan hard-cap kaku agar solver fleksibel menemukan kombinasi terbaik
-            shift_vars[d][s_code] = pulp.LpVariable(var_name, lowBound=0, cat='Integer')
-            
-    overstaff_vars = {}
-    understaff_vars = {}
-    interval_coverage = {dt: [] for dt in df_result['Datetime']}
-    
-    for d in unique_dates:
-        d_ts = pd.to_datetime(d)
-        for s_code, start_time in master_shifts.items():
-            try:
-                start_dt = d_ts + pd.to_timedelta(str(start_time))
-                for i in range(18): 
-                    active_dt = start_dt + pd.Timedelta(minutes=30 * i)
-                    if active_dt in interval_coverage:
-                        interval_coverage[active_dt].append(shift_vars[d][s_code])
-            except Exception:
-                continue 
-                    
-    # Menerapkan Soft Constraints pada setiap interval
-    for idx, row in df_result.iterrows():
-        dt = row['Datetime']
-        req = row['Agent_Needed_Adjust']
-        active_vars = interval_coverage.get(dt, [])
-        
-        if active_vars:
-            over_var = pulp.LpVariable(f"Over_{dt.strftime('%Y%m%d_%H%M')}", lowBound=0)
-            under_var = pulp.LpVariable(f"Under_{dt.strftime('%Y%m%d_%H%M')}", lowBound=0)
-            overstaff_vars[dt] = over_var
-            understaff_vars[dt] = under_var
-            
-            # Active + Under - Over == Req (Memungkinkan solver mencari solusi tanpa crash)
-            prob += pulp.lpSum(active_vars) + under_var - over_var == req, f"Cov_{dt.strftime('%Y%m%d_%H%M')}"
-            
-    # Fungsi Objektif Seimbang (Minimalkan total agen, cegah kekurangan drastis, ratakan kelebihan)
-    prob += 1000 * pulp.lpSum([shift_vars[d][s] for d in unique_dates for s in master_shifts.keys()]) + \
-            50000 * pulp.lpSum(understaff_vars.values()) + \
-            1 * pulp.lpSum(overstaff_vars.values()), "Objective_Realistic_Distribution"
-            
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    # Urutkan shift berdasarkan waktu mulai dari yang paling pagi
+    shift_items = []
+    for s_code, s_time in master_shifts.items():
+        t_obj = pd.to_timedelta(str(s_time))
+        shift_items.append((s_code, t_obj))
+    shift_items.sort(key=lambda x: x[1])
     
     results = []
+    unique_dates = df_result['Date'].unique()
+    
     for d in unique_dates:
+        df_day = df_result[df_result['Date'] == d].sort_values('Datetime').copy()
+        day_shifts = {s[0]: 0 for s in shift_items}
+        
+        reqs = {row['Datetime']: row['Agent_Needed_Adjust'] for _, row in df_day.iterrows()}
+        coverage = {row['Datetime']: 0 for _, row in df_day.iterrows()}
+        d_ts = pd.to_datetime(d)
+        
+        # Iterasi kronologis per interval (meniru logika manual WFM)
+        for _, row in df_day.iterrows():
+            dt = row['Datetime']
+            current_req = reqs.get(dt, 0)
+            current_cov = coverage.get(dt, 0)
+            
+            if current_cov < current_req:
+                deficit = current_req - current_cov
+                
+                # Cari shift yang mulai aktif pada waktu tersebut atau paling mendekati sebelumnya
+                best_shift = None
+                min_diff = datetime.timedelta(hours=24)
+                
+                for s_code, s_td in shift_items:
+                    s_dt_time = (d_ts + s_td).time()
+                    if s_td <= (dt - d_ts):
+                        diff = (dt - d_ts) - s_td
+                        if diff < min_diff:
+                            min_diff = diff
+                            best_shift = s_code
+                
+                # Jika belum ada shift yang berjalan, arahkan ke shift paling awal (S1)
+                if not best_shift and shift_items:
+                    best_shift = shift_items[0][0]
+                    
+                if best_shift:
+                    day_shifts[best_shift] += deficit
+                    # Tambahkan cakupan aktif agen tersebut untuk durasi 9 jam kedepan (18 interval)
+                    s_start_td = dict(shift_items)[best_shift]
+                    shift_start_dt = d_ts + s_start_td
+                    for i in range(18):
+                        active_dt = shift_start_dt + pd.Timedelta(minutes=30 * i)
+                        if active_dt in coverage:
+                            coverage[active_dt] += deficit
+                            
         row_res = {'Tanggal': d}
         total = 0
-        for s_code in master_shifts.keys():
-            val = int(shift_vars[d][s_code].varValue)
+        for s_code, _ in shift_items:
+            val = day_shifts[s_code]
             row_res[s_code] = val
             total += val
         row_res['Total_Agent_Shift'] = total
-        if d == prev_date and total == 0:
-            continue
         results.append(row_res)
+        
     return pd.DataFrame(results)
 
 # --- FUNGSI ERLANG C ITERATIF ---
@@ -458,10 +455,10 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL']]
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
-        with st.spinner("Mengoptimasi Distribusi Shift (Soft-Constraint Smoothing) dengan PuLP..."):
+        with st.spinner("Menjalankan Alokasi Shift Beruntun (Sequential Greedy Allocator)..."):
             df_shift_dist = optimize_shift_distribution(df_result, active_shifts)
 
-        st.success("🎉 Seluruh Proses Selesai!")
+        st.success("🎉 Seluruh Proses Selesai dengan Logika Alokasi Beruntun!")
         
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "📊 Forecast & Cleansing", 
@@ -501,7 +498,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
         with tab5:
             st.subheader("Matriks Optimal Kebutuhan Slot Shift")
-            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan profil pola jam sibuk {months_profile} bulan terakhir (Model Soft-Constraints Realistis).")
+            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan penambahan beruntun (*Sequential Incremental Matching*) dari profil {months_profile} bulan terakhir.")
             
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
@@ -510,7 +507,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 df_chart = df_shift_dist.set_index('Tanggal').drop(columns=['Total_Agent_Shift'])
                 st.bar_chart(df_chart)
             else:
-                st.warning("⚠️ Sistem tidak dapat menemukan kombinasi shift yang menutupi seluruh SLA (Infeasible). Coba tambahkan variasi kode shift malam atau kurangi Target SL.")
+                st.warning("⚠️ Belum ada data shift yang terbentuk.")
 
         # Tombol Download Excel
         st.write("---")
