@@ -23,7 +23,7 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI ALOKASI SHIFT BERTAHAP (SMOOTH INCREMENTAL ALLOCATOR) ---
+# --- FUNGSI ALOKASI SHIFT BERTAHAP DENGAN KONTROL SHIFT MALAM ---
 @st.cache_data(show_spinner=False)
 def optimize_shift_distribution(df_result, master_shifts):
     shift_items = []
@@ -59,6 +59,12 @@ def optimize_shift_distribution(df_result, master_shifts):
                     eligible_shifts = shift_items
                 
                 best_shift = max(eligible_shifts, key=lambda x: x[1])[0]
+                
+                if best_shift in ['S11', 'S19', 'S20'] and day_shifts[best_shift] >= 12:
+                    other_shifts = [s for s in eligible_shifts if s[0] not in ['S11', 'S19', 'S20']]
+                    if other_shifts:
+                        best_shift = max(other_shifts, key=lambda x: x[1])[0]
+                
                 increment = min(deficit, max(1, math.ceil(deficit / 2)))
                 day_shifts[best_shift] += increment
                 
@@ -296,7 +302,6 @@ use_payday = st.sidebar.checkbox("💰 Aktifkan Auto-Payday (Tgl 1 & 25)", value
 if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
     if file_cof and file_aht:
         
-        # --- PRE-PROCESSING MASTER SHIFT ---
         active_shifts = DEFAULT_SHIFTS.copy()
         if file_shift is not None:
             try:
@@ -429,10 +434,10 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_daily_display['Max_Kebutuhan_Agent'] = df_daily_display['Max_Kebutuhan_Agent'].astype(int)
             df_daily_display['Rata_Rata_SL'] = df_daily_display['Rata_Rata_SL'].apply(lambda x: f"{x:.2%}")
             
-            df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL']]
+            df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']]
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
-        with st.spinner("Menjalankan Alokasi Shift Bertahap (Smooth Incremental Allocator)..."):
+        with st.spinner("Menjalankan Alokasi Shift Stabil (Controlled Incremental Allocator)..."):
             df_shift_dist = optimize_shift_distribution(df_result, active_shifts)
 
         st.success("🎉 Seluruh Proses Selesai!")
@@ -475,7 +480,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
         with tab5:
             st.subheader("Matriks Optimal Kebutuhan Slot Shift")
-            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan alokasi bertahap dari profil {months_profile} bulan terakhir.")
+            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift dengan proteksi kestabilan shift malam dari profil {months_profile} bulan terakhir.")
             
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
