@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import math
 import io
+import pulp
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.metrics import mean_absolute_percentage_error
@@ -12,6 +13,79 @@ warnings.filterwarnings('ignore')
 # --- KONFIGURASI HALAMAN ---
 st.set_page_config(page_title="WFM Forecast & Capacity Planner", layout="wide")
 st.title("WFM Forecast & Capacity Planning Tool")
+
+# --- FALLBACK KAMUS SHIFT 24 JAM (DEFAULT) ---
+DEFAULT_SHIFTS = {
+    'S1': '06:00:00', 'S2': '07:00:00', 'S2.3': '07:30:00', 'S3': '08:00:00', 
+    'S3.3': '08:30:00', 'S4': '09:00:00', 'S5': '10:00:00', 'S6': '11:00:00', 
+    'S6.3': '11:30:00', 'S7': '12:00:00', 'S8': '13:00:00', 'S9': '14:00:00', 
+    'S10': '15:00:00', 'S10.3': '15:30:00', 'S19': '19:00:00', 'S20': '20:00:00', 
+    'S11': '21:00:00'
+}
+
+# --- FUNGSI OPTIMASI SHIFT (PULP) ---
+def optimize_shift_distribution(df_result, master_shifts):
+    prob = pulp.LpProblem("Shift_Optimization", pulp.LpMinimize)
+    
+    first_date = df_result['Date'].min()
+    prev_date = first_date - pd.Timedelta(days=1)
+    unique_dates = [prev_date] + list(df_result['Date'].unique())
+    
+    # 1. Definisikan Variabel
+    shift_vars = {}
+    for d in unique_dates:
+        shift_vars[d] = {}
+        for s_code in master_shifts.keys():
+            var_name = f"X_{str(d).replace('-','')}_{str(s_code).replace('.','_')}"
+            shift_vars[d][s_code] = pulp.LpVariable(var_name, lowBound=0, cat='Integer')
+            
+    # 2. Fungsi Objektif
+    prob += pulp.lpSum([shift_vars[d][s] for d in unique_dates for s in master_shifts.keys()]), "Total_Agents"
+    
+    # 3. Pemetaan Interval
+    interval_coverage = {dt: [] for dt in df_result['Datetime']}
+    
+    for d in unique_dates:
+        d_ts = pd.to_datetime(d)
+        for s_code, start_time in master_shifts.items():
+            try:
+                # Memastikan format waktu bisa dibaca oleh Pandas
+                start_dt = d_ts + pd.to_timedelta(str(start_time))
+                # Durasi 9 Jam = 18 interval x 30 menit
+                for i in range(18):
+                    active_dt = start_dt + pd.Timedelta(minutes=30 * i)
+                    if active_dt in interval_coverage:
+                        interval_coverage[active_dt].append(shift_vars[d][s_code])
+            except Exception:
+                continue # Mengabaikan baris jika format waktu tidak valid
+                    
+    # 4. Fungsi Kendala (Constraint)
+    for idx, row in df_result.iterrows():
+        dt = row['Datetime']
+        req = row['Agent_Needed_Adjust']
+        active_vars = interval_coverage.get(dt, [])
+        if active_vars:
+            prob += pulp.lpSum(active_vars) >= req, f"Cov_{dt.strftime('%Y%m%d_%H%M')}"
+            
+    # 5. Eksekusi Engine Solver
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    
+    # 6. Ekstraksi Hasil
+    results = []
+    if pulp.LpStatus[prob.status] == 'Optimal':
+        for d in unique_dates:
+            row_res = {'Tanggal': d}
+            total = 0
+            for s_code in master_shifts.keys():
+                val = int(shift_vars[d][s_code].varValue)
+                row_res[s_code] = val
+                total += val
+            row_res['Total_Agent_Shift'] = total
+            if d == prev_date and total == 0:
+                continue
+            results.append(row_res)
+            
+    return pd.DataFrame(results)
 
 # --- FUNGSI ERLANG C ITERATIF ---
 def erlang_c_prob(agents, traffic):
@@ -28,7 +102,7 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time):
     if pd.isna(cof) or pd.isna(aht_seconds) or cof <= 0:
         return 0, 0.0, 1.0
     
-    interval_seconds = 1800 # 30 menit
+    interval_seconds = 1800 
     traffic = (cof * aht_seconds) / interval_seconds
     agents = math.ceil(traffic)
     if agents == 0:
@@ -52,19 +126,14 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time):
 # --- FUNGSI CLEANSING HOLT-WINTERS ---
 def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_residual=15):
     series = df[target_col].ffill().bfill()
-    
     model = ExponentialSmoothing(series, trend='add', seasonal='add', seasonal_periods=seasonal_periods, initialization_method="estimated")
     hw_fit = model.fit()
     fitted_values = hw_fit.fittedvalues
-    
     residuals = np.abs(series - fitted_values)
     std_dev = np.std(residuals)
-    
     is_anomaly = (residuals > (threshold * std_dev)) & (residuals > min_residual)
-    
     cleansed_series = series.copy()
     cleansed_series[is_anomaly] = fitted_values[is_anomaly]
-    
     return cleansed_series, is_anomaly
 
 # --- FUNGSI FORECAST PROPHET ---
@@ -93,7 +162,6 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
     if use_auto_payday:
         start_date = df_prophet['ds'].min()
         end_date = pd.to_datetime(end_fcst)
-        
         dr = pd.date_range(start=start_date, end=end_date)
         months = dr.to_period('M').unique()
         
@@ -146,6 +214,7 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
 st.sidebar.header("📂 1. Upload Database")
 file_cof = st.sidebar.file_uploader("Upload Data COF (Interval 30 Min)", type=['csv', 'xlsx'])
 file_aht = st.sidebar.file_uploader("Upload Data AHT (Interval 30 Min)", type=['csv', 'xlsx'])
+file_shift = st.sidebar.file_uploader("Upload Master Shift (Opsional)", type=['csv', 'xlsx'], help="Jika dikosongkan, sistem menggunakan Shift 24 Jam Default.")
 file_holidays = st.sidebar.file_uploader("Upload Data Libur Nasional (Opsional)", type=['csv', 'xlsx'])
 
 st.sidebar.header("⚙️ 2. Konfigurasi Erlang C")
@@ -166,6 +235,22 @@ use_payday = st.sidebar.checkbox("💰 Aktifkan Auto-Payday (Tgl 1 & 25)", value
 # --- PROSES UTAMA ---
 if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
     if file_cof and file_aht:
+        
+        # --- PRE-PROCESSING MASTER SHIFT ---
+        active_shifts = DEFAULT_SHIFTS.copy()
+        if file_shift is not None:
+            try:
+                df_s = pd.read_csv(file_shift) if file_shift.name.endswith('csv') else pd.read_excel(file_shift)
+                if 'Kode_Shift' in df_s.columns and 'Waktu_Mulai' in df_s.columns:
+                    # Mengkonversi ke dictionary dinamis
+                    df_s['Waktu_Mulai'] = df_s['Waktu_Mulai'].astype(str)
+                    active_shifts = dict(zip(df_s['Kode_Shift'], df_s['Waktu_Mulai']))
+                    st.toast("✅ Master Shift kustom berhasil dimuat!", icon="🧩")
+                else:
+                    st.warning("Kolom 'Kode_Shift' atau 'Waktu_Mulai' tidak ditemukan. Menggunakan Shift Default.")
+            except Exception as e:
+                st.warning(f"Gagal membaca file Shift, menggunakan Shift Default. Error: {e}")
+                
         with st.spinner("Memproses cleansing, payday, dan forecasting. Mohon tunggu..."):
             df_cof = pd.read_csv(file_cof) if file_cof.name.endswith('csv') else pd.read_excel(file_cof)
             df_aht = pd.read_csv(file_aht) if file_aht.name.endswith('csv') else pd.read_excel(file_aht)
@@ -180,20 +265,16 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof = df_cof[(df_cof['Datetime'] >= pd.to_datetime(start_hist)) & (df_cof['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             df_aht = df_aht[(df_aht['Datetime'] >= pd.to_datetime(start_hist)) & (df_aht['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             
-            # Cleansing
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
             
-            # Forecasting
             forecast_cof, mape_cof = run_prophet(df_cof, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
             forecast_aht, mape_aht = run_prophet(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
             
             df_result = pd.merge(forecast_cof, forecast_aht, on='Datetime')
             
-            # Pembulatan COF
             df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
-            # Erlang C Kalkulasi
             df_result['Base_Agent_Needed'] = 0
             df_result['Projected_Wait_Time'] = 0.0
             df_result['Service_Level_Achieved'] = 0.0
@@ -207,24 +288,18 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
             df_result['Date'] = df_result['Datetime'].dt.date
             
-            # --- AGREGASI KEBUTUHAN (WORKLOAD & PEAK) ---
             total_cof_bulan = df_result['COF_forecast'].sum()
             avg_aht_bulan = df_result['AHT_forecast'].mean()
             avg_sl_bulan = df_result['Service_Level_Achieved'].mean()
             
-            # Kebutuhan Workstation (Peak)
             kebutuhan_ws_bulan = df_result['Agent_Needed_Adjust'].max() 
-            
-            # Kebutuhan Headcount Harian Manusia (FTE)
             df_daily_workload_hours = df_result.groupby('Date')['Agent_Needed_Adjust'].sum() * 0.5
             daily_headcount_needed = np.ceil(df_daily_workload_hours / work_hours)
             
-            # Kebutuhan Headcount Bulanan
             avg_daily_headcount_needed = daily_headcount_needed.mean()
             total_hari_forecast = (pd.to_datetime(end_forecast) - pd.to_datetime(start_forecast)).days + 1
             total_monthly_headcount = math.ceil((avg_daily_headcount_needed * total_hari_forecast) / work_days)
 
-            # --- AGREGASI HARIAN UNTUK TABEL ---
             df_daily = df_result.groupby('Date').agg(
                 Total_COF=('COF_forecast', 'sum'),
                 Rata_Rata_AHT=('AHT_forecast', 'mean'),
@@ -232,74 +307,82 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 Rata_Rata_SL=('Service_Level_Achieved', 'mean')
             ).reset_index()
 
-            # Mapping nilai Headcount Harian (FTE) ke dalam tabel harian
             df_daily['Headcount_Harian_FTE'] = df_daily['Date'].map(daily_headcount_needed)
 
-            # Format dan Atur Ulang Kolom untuk Tampilan
             df_daily_display = df_daily.copy()
             df_daily_display['Total_COF'] = df_daily_display['Total_COF'].astype(int) 
             df_daily_display['Rata_Rata_AHT'] = df_daily_display['Rata_Rata_AHT'].apply(lambda x: f"{x:.0f} s")
-            df_daily_display['Headcount_Harian_FTE'] = df_daily_display['Headcount_Harian_FTE'].astype(int) # Kolom Baru
+            df_daily_display['Headcount_Harian_FTE'] = df_daily_display['Headcount_Harian_FTE'].astype(int) 
             df_daily_display['Max_Kebutuhan_Agent'] = df_daily_display['Max_Kebutuhan_Agent'].astype(int)
             df_daily_display['Rata_Rata_SL'] = df_daily_display['Rata_Rata_SL'].apply(lambda x: f"{x:.2%}")
             
-            # Menyusun urutan kolom sesuai permintaan (Headcount Harian diselipkan sebelum Peak)
             df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL']]
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
-            # TAMPILAN UI
-            st.success("Proses Selesai!")
-            
-            tab1, tab2, tab3, tab4 = st.tabs([
-                "📊 Forecast & Cleansing", 
-                "👥 Kebutuhan Agent (Bulanan)", 
-                "📅 Hasil Harian",
-                "⏱️ Detail Interval"
-            ])
-            
-            with tab1:
-                st.subheader("Prediksi COF (Call Offered)")
-                st.line_chart(df_result.set_index('Datetime')['COF_forecast'])
-                st.subheader("Prediksi AHT (Average Handle Time)")
-                st.line_chart(df_result.set_index('Datetime')['AHT_forecast'])
-                
-            with tab2:
-                st.subheader("Ringkasan Kapasitas Bulanan")
-                st.markdown("Kalkulasi Agent sudah dipisahkan menggunakan metode Sizing by Workload (FTE).")
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Total COF (1 Bulan)", f"{total_cof_bulan:,}")
-                c2.metric("Rata-rata SL Projection", f"{avg_sl_bulan:.2%}")
-                c3.metric("Rata-rata AHT", f"{avg_aht_bulan:.0f} Detik")
-                
-                st.markdown("---")
-                c4, c5 = st.columns(2)
-                c4.metric("Total Headcount Manusia (FTE)", total_monthly_headcount, help=f"Total agen yang harus direkrut dalam 1 bulan (Asumsi 1 agen = {work_hours} jam kerja/hari & {work_days} hari/bulan).")
-                c5.metric("Kebutuhan Lisensi/PC Maksimal", int(kebutuhan_ws_bulan), help="Peak concurrency: Jumlah kursi terbanyak yang dibutuhkan dalam satu waktu.")
-                
-            with tab3:
-                st.subheader("Rincian Forecast per Hari")
-                st.dataframe(df_daily_display, use_container_width=True)
-                
-            with tab4:
-                st.subheader("Detail Kalkulasi per Interval (30 Menit)")
-                tabel_interval = df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Service_Level_Achieved', 'Projected_Wait_Time']].copy()
-                tabel_interval['Service_Level_Achieved'] = tabel_interval['Service_Level_Achieved'].apply(lambda x: f"{x:.2%}")
-                st.dataframe(tabel_interval, use_container_width=True)
+        with st.spinner("Mengoptimasi Slot Shift 24 Jam dengan PuLP. Mohon tunggu..."):
+            df_shift_dist = optimize_shift_distribution(df_result, active_shifts)
 
-            # Tombol Download Excel
-            st.write("---")
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                df_daily_display.to_excel(writer, sheet_name='Hasil_Harian', index=False)
-                tabel_interval.to_excel(writer, sheet_name='Detail_Interval', index=False)
+        st.success("Seluruh Proses Selesai!")
+        
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "📊 Forecast & Cleansing", 
+            "👥 Kapasitas (Bulanan)", 
+            "📅 Hasil Harian",
+            "⏱️ Detail Interval",
+            "🧩 Distribusi Shift"
+        ])
+        
+        with tab1:
+            st.subheader("Prediksi COF (Call Offered)")
+            st.line_chart(df_result.set_index('Datetime')['COF_forecast'])
+            st.subheader("Prediksi AHT (Average Handle Time)")
+            st.line_chart(df_result.set_index('Datetime')['AHT_forecast'])
             
-            st.download_button(
-                label="📥 Download Laporan Lengkap (Excel)",
-                data=output.getvalue(),
-                file_name=f"Forecast_WFM_{start_forecast}_to_{end_forecast}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+        with tab2:
+            st.subheader("Ringkasan Kapasitas Bulanan")
+            st.markdown("Kalkulasi Agent sudah dipisahkan menggunakan metode Sizing by Workload (FTE).")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total COF (1 Bulan)", f"{total_cof_bulan:,}")
+            c2.metric("Rata-rata SL Projection", f"{avg_sl_bulan:.2%}")
+            c3.metric("Rata-rata AHT", f"{avg_aht_bulan:.0f} Detik")
+            st.markdown("---")
+            c4, c5 = st.columns(2)
+            c4.metric("Total Headcount Manusia (FTE)", total_monthly_headcount)
+            c5.metric("Kebutuhan Lisensi/PC Maksimal", int(kebutuhan_ws_bulan))
+            
+        with tab3:
+            st.subheader("Rincian Forecast per Hari")
+            st.dataframe(df_daily_display, use_container_width=True)
+            
+        with tab4:
+            st.subheader("Detail Kalkulasi per Interval (30 Menit)")
+            tabel_interval = df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Service_Level_Achieved', 'Projected_Wait_Time']].copy()
+            tabel_interval['Service_Level_Achieved'] = tabel_interval['Service_Level_Achieved'].apply(lambda x: f"{x:.2%}")
+            st.dataframe(tabel_interval, use_container_width=True)
+            
+        with tab5:
+            st.subheader("Matriks Optimal Kebutuhan Slot Shift")
+            st.markdown("Berikut adalah jumlah slot ideal untuk masing-masing shift agar menutupi SLA secara efisien selama 24 jam penuh.")
+            if not df_shift_dist.empty:
+                st.dataframe(df_shift_dist, use_container_width=True)
+            else:
+                st.error("Gagal melakukan optimasi shift. Periksa kembali batasan data Anda.")
+
+        # Tombol Download Excel
+        st.write("---")
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df_daily_display.to_excel(writer, sheet_name='Hasil_Harian', index=False)
+            tabel_interval.to_excel(writer, sheet_name='Detail_Interval', index=False)
+            if not df_shift_dist.empty:
+                df_shift_dist.to_excel(writer, sheet_name='Distribusi_Shift', index=False)
+        
+        st.download_button(
+            label="📥 Download Laporan Lengkap (Excel)",
+            data=output.getvalue(),
+            file_name=f"Forecast_WFM_{start_forecast}_to_{end_forecast}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     else:
         st.error("Mohon unggah file COF dan AHT terlebih dahulu.")
