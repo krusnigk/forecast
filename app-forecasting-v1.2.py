@@ -23,10 +23,9 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI ALOKASI SHIFT BERUNTUN (SEQUENTIAL GREEDY ALLOCATOR) ---
+# --- FUNGSI ALOKASI SHIFT BERTAHAP (SMOOTH INCREMENTAL ALLOCATOR) ---
 @st.cache_data(show_spinner=False)
 def optimize_shift_distribution(df_result, master_shifts):
-    # Urutkan shift berdasarkan waktu mulai dari yang paling pagi
     shift_items = []
     for s_code, s_time in master_shifts.items():
         t_obj = pd.to_timedelta(str(s_time))
@@ -39,46 +38,30 @@ def optimize_shift_distribution(df_result, master_shifts):
     for d in unique_dates:
         df_day = df_result[df_result['Date'] == d].sort_values('Datetime').copy()
         day_shifts = {s[0]: 0 for s in shift_items}
-        
-        reqs = {row['Datetime']: row['Agent_Needed_Adjust'] for _, row in df_day.iterrows()}
-        coverage = {row['Datetime']: 0 for _, row in df_day.iterrows()}
         d_ts = pd.to_datetime(d)
         
-        # Iterasi kronologis per interval (meniru logika manual WFM)
         for _, row in df_day.iterrows():
             dt = row['Datetime']
-            current_req = reqs.get(dt, 0)
-            current_cov = coverage.get(dt, 0)
+            req = row['Agent_Needed_Adjust']
             
-            if current_cov < current_req:
-                deficit = current_req - current_cov
+            current_active = 0
+            for s_code, count in day_shifts.items():
+                s_td = dict(shift_items)[s_code]
+                start_dt = d_ts + s_td
+                end_dt = start_dt + pd.Timedelta(hours=9)
+                if start_dt <= dt < end_dt:
+                    current_active += count
+            
+            if current_active < req:
+                deficit = req - current_active
+                eligible_shifts = [(s_code, s_td) for s_code, s_td in shift_items if (d_ts + s_td) <= dt]
+                if not eligible_shifts:
+                    eligible_shifts = shift_items
                 
-                # Cari shift yang mulai aktif pada waktu tersebut atau paling mendekati sebelumnya
-                best_shift = None
-                min_diff = datetime.timedelta(hours=24)
+                best_shift = max(eligible_shifts, key=lambda x: x[1])[0]
+                increment = min(deficit, max(1, math.ceil(deficit / 2)))
+                day_shifts[best_shift] += increment
                 
-                for s_code, s_td in shift_items:
-                    s_dt_time = (d_ts + s_td).time()
-                    if s_td <= (dt - d_ts):
-                        diff = (dt - d_ts) - s_td
-                        if diff < min_diff:
-                            min_diff = diff
-                            best_shift = s_code
-                
-                # Jika belum ada shift yang berjalan, arahkan ke shift paling awal (S1)
-                if not best_shift and shift_items:
-                    best_shift = shift_items[0][0]
-                    
-                if best_shift:
-                    day_shifts[best_shift] += deficit
-                    # Tambahkan cakupan aktif agen tersebut untuk durasi 9 jam kedepan (18 interval)
-                    s_start_td = dict(shift_items)[best_shift]
-                    shift_start_dt = d_ts + s_start_td
-                    for i in range(18):
-                        active_dt = shift_start_dt + pd.Timedelta(minutes=30 * i)
-                        if active_dt in coverage:
-                            coverage[active_dt] += deficit
-                            
         row_res = {'Tanggal': d}
         total = 0
         for s_code, _ in shift_items:
@@ -331,7 +314,6 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof = pd.read_csv(file_cof) if file_cof.name.endswith('csv') else pd.read_excel(file_cof)
             df_aht = pd.read_csv(file_aht) if file_aht.name.endswith('csv') else pd.read_excel(file_aht)
             
-            # VALIDASI KOLOM (ERROR HANDLING)
             if not {'Datetime', 'COF'}.issubset(df_cof.columns):
                 st.error("❌ Format Gagal! File COF wajib memiliki kolom 'Datetime' dan 'COF'.")
                 st.stop()
@@ -353,14 +335,12 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
             
-            # 1. Hitung Macro Forecast (Harian) untuk COF
             df_cof_daily = df_cof.groupby(df_cof['Datetime'].dt.date)['COF_cleansed'].sum().reset_index()
             df_cof_daily.columns = ['Date', 'COF']
             df_cof_daily['Date'] = pd.to_datetime(df_cof_daily['Date'])
             
             forecast_cof_daily = run_prophet_daily(df_cof_daily, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
             
-            # 2. Ambil Data Sesuai Pilihan Slider untuk Intraday Profile COF
             max_hist_date = df_cof['Datetime'].max()
             profile_start_date = max_hist_date - pd.DateOffset(months=months_profile)
             df_recent = df_cof[df_cof['Datetime'] >= profile_start_date].copy()
@@ -379,7 +359,6 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             sum_ratios = profile.groupby('Is_Weekend')['Ratio'].transform('sum')
             profile['Ratio'] = profile['Ratio'] / sum_ratios
             
-            # 3. Rekombinasi Macro Harian dengan Profil Intraday COF
             forecast_dates = pd.date_range(start=start_forecast, end=end_forecast)
             reconstructed_rows = []
             
@@ -403,8 +382,6 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                     })
                     
             forecast_cof_final = pd.DataFrame(reconstructed_rows)
-            
-            # 4. Forecast AHT Menggunakan Interval-Level Prophet (Dinamis per 30 Menit)
             forecast_aht_final, _ = run_prophet_interval(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
             
             df_result = pd.merge(forecast_cof_final, forecast_aht_final, on='Datetime')
@@ -455,10 +432,10 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL']]
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
-        with st.spinner("Menjalankan Alokasi Shift Beruntun (Sequential Greedy Allocator)..."):
+        with st.spinner("Menjalankan Alokasi Shift Bertahap (Smooth Incremental Allocator)..."):
             df_shift_dist = optimize_shift_distribution(df_result, active_shifts)
 
-        st.success("🎉 Seluruh Proses Selesai dengan Logika Alokasi Beruntun!")
+        st.success("🎉 Seluruh Proses Selesai!")
         
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "📊 Forecast & Cleansing", 
@@ -498,7 +475,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
         with tab5:
             st.subheader("Matriks Optimal Kebutuhan Slot Shift")
-            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan penambahan beruntun (*Sequential Incremental Matching*) dari profil {months_profile} bulan terakhir.")
+            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan alokasi bertahap dari profil {months_profile} bulan terakhir.")
             
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
@@ -509,7 +486,6 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             else:
                 st.warning("⚠️ Belum ada data shift yang terbentuk.")
 
-        # Tombol Download Excel
         st.write("---")
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
