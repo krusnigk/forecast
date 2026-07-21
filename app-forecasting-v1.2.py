@@ -74,8 +74,8 @@ def optimize_shift_distribution(df_result, master_shifts):
     prob += 100 * pulp.lpSum([shift_vars[d][s] for d in unique_dates for s in master_shifts.keys()]) + \
             1 * pulp.lpSum(overstaff_vars.values()), "Objective_Smooth_Roster"
             
-    # 6. Eksekusi Engine Solver
-    prob.solve(pulp.LpProblem.LpSolverDefault)
+    # 6. Eksekusi Engine Solver (Diperbaiki menggunakan PULP_CBC_CMD agar aman)
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
     
     # 7. Ekstraksi Hasil
     results = []
