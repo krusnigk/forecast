@@ -74,7 +74,7 @@ def optimize_shift_distribution(df_result, master_shifts):
             1 * pulp.lpSum(overstaff_vars.values()), "Objective_Smooth_Roster"
             
     # 6. Eksekusi Engine Solver
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    prob.solve(pulp.LpProblem.LpSolverDefault)
     
     # 7. Ekstraksi Hasil
     results = []
@@ -130,7 +130,7 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time):
         
     return agents, asa, sl
 
-# --- FUNGSI CLEANSING HOLT-WINTERS DENGAN CACHING ---
+# --- FUNGSI CLEANSING HOLT-WINTERS ---
 @st.cache_data(show_spinner=False)
 def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_residual=15):
     series = df[target_col].ffill().bfill()
@@ -144,15 +144,13 @@ def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_resi
     cleansed_series[is_anomaly] = fitted_values[is_anomaly]
     return cleansed_series, is_anomaly
 
-# --- FUNGSI FORECAST PROPHET DENGAN CACHING ---
+# --- FUNGSI PROPHET UNTUK HARIAN (MACRO FORECAST) ---
 @st.cache_data(show_spinner=False)
-def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto_payday=True):
+def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fcst, use_auto_payday=True):
     df_prophet = pd.DataFrame({
-        'ds': df_hist['Datetime'],
-        'y': df_hist[f'{target_col}_cleansed']
+        'ds': df_hist_daily['Date'],
+        'y': df_hist_daily[target_col]
     })
-    
-    df_prophet['y'] = df_prophet['y'].replace(0, 0.01)
     
     holidays_list = []
     holiday_dates = []
@@ -194,32 +192,27 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
         
     final_holidays = pd.concat(holidays_list, ignore_index=True) if holidays_list else None
         
-    model = Prophet(holidays=final_holidays, daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, seasonality_mode='multiplicative')
+    model = Prophet(holidays=final_holidays, daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True, seasonality_mode='multiplicative')
     model.fit(df_prophet)
     
     last_hist_date = df_prophet['ds'].max()
-    end_fcst_dt = pd.to_datetime(end_fcst) + pd.Timedelta(days=1, minutes=-30)
+    end_fcst_dt = pd.to_datetime(end_fcst)
     
     if end_fcst_dt > last_hist_date:
         delta = end_fcst_dt - last_hist_date
-        periods = int(delta.total_seconds() / 1800)
+        periods = delta.days
     else:
         periods = 0
         
-    future = model.make_future_dataframe(periods=periods, freq='30min', include_history=True)
+    future = model.make_future_dataframe(periods=periods, freq='D', include_history=False)
     forecast = model.predict(future)
-    
-    historical_forecast = forecast.iloc[:len(df_prophet)]
-    mape = mean_absolute_percentage_error(df_prophet['y'], historical_forecast['yhat']) * 100
     
     start_fcst_dt = pd.to_datetime(start_fcst)
     future_forecast = forecast[(forecast['ds'] >= start_fcst_dt) & (forecast['ds'] <= end_fcst_dt)][['ds', 'yhat']]
-    future_forecast.rename(columns={'ds': 'Datetime', 'yhat': f'{target_col}_forecast'}, inplace=True)
+    future_forecast.rename(columns={'ds': 'Date', 'yhat': f'{target_col}_daily_forecast'}, inplace=True)
+    future_forecast[f'{target_col}_daily_forecast'] = future_forecast[f'{target_col}_daily_forecast'].clip(lower=1)
     
-    # Menghindari COF Forecast = 0 murni agar grafik tetap estetik
-    future_forecast[f'{target_col}_forecast'] = future_forecast[f'{target_col}_forecast'].clip(lower=0.1)
-    
-    return future_forecast, mape
+    return future_forecast
 
 # --- UI SIDEBAR ---
 st.sidebar.header("📂 1. Upload Database")
@@ -283,17 +276,89 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof = df_cof[(df_cof['Datetime'] >= pd.to_datetime(start_hist)) & (df_cof['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             df_aht = df_aht[(df_aht['Datetime'] >= pd.to_datetime(start_hist)) & (df_aht['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             
-        with st.spinner("Melatih Model AI (Cleansing & Prophet Forecast)..."):
+        with st.spinner("Melatih Model AI & Menerapkan 3-Month Intraday Profiling..."):
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
             
-            forecast_cof, mape_cof = run_prophet(df_cof, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
-            forecast_aht, mape_aht = run_prophet(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
+            # 1. Hitung Macro Forecast (Harian) untuk COF
+            df_cof_daily = df_cof.groupby(df_cof['Datetime'].dt.date)['COF_cleansed'].sum().reset_index()
+            df_cof_daily.columns = ['Date', 'COF']
+            df_cof_daily['Date'] = pd.to_datetime(df_cof_daily['Date'])
             
-        with st.spinner("Kalkulasi Antrean Erlang C..."):
-            df_result = pd.merge(forecast_cof, forecast_aht, on='Datetime')
+            forecast_cof_daily = run_prophet_daily(df_cof_daily, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
+            
+            # 2. Ambil 3 Bulan Terakhir dari Data Historis untuk Intraday Profile
+            max_hist_date = df_cof['Datetime'].max()
+            three_months_ago = max_hist_date - pd.DateOffset(months=3)
+            df_recent = df_cof[df_cof['Datetime'] >= three_months_ago].copy()
+            
+            df_recent['Time'] = df_recent['Datetime'].dt.time
+            df_recent['Is_Weekend'] = df_recent['Datetime'].dt.weekday >= 5
+            
+            # Hitung total harian pada data recent untuk mendapatkan bobot rasio
+            df_recent['Date_Only'] = df_recent['Datetime'].dt.date
+            daily_totals = df_recent.groupby(['Date_Only', 'Is_Weekend'])['COF_cleansed'].sum().reset_index()
+            daily_totals.rename(columns={'COF_cleansed': 'Daily_Total'}, inplace=True)
+            
+            df_recent = pd.merge(df_recent, daily_totals, on=['Date_Only', 'Is_Weekend'])
+            df_recent['Ratio'] = df_recent['COF_cleansed'] / df_recent['Daily_Total']
+            
+            # Rata-ratakan rasio per Jam (Time) dan jenis hari (Is_Weekend)
+            profile = df_recent.groupby(['Is_Weekend', 'Time'])['Ratio'].mean().reset_index()
+            
+            # Normalisasi profil agar totalnya pas 1.0 per tipe hari
+            sum_ratios = profile.groupby('Is_Weekend')['Ratio'].transform('sum')
+            profile['Ratio'] = profile['Ratio'] / sum_ratios
+            
+            # 3. Rekombinasi Macro Harian dengan Profil Intraday 3 Bulan
+            forecast_dates = pd.date_range(start=start_forecast, end=end_forecast)
+            reconstructed_rows = []
+            
+            for d in forecast_dates:
+                d_date = d.date()
+                match_row = forecast_cof_daily[forecast_cof_daily['Date'] == pd.to_datetime(d_date)]
+                if match_row.empty:
+                    continue
+                daily_val = match_row['COF_daily_forecast'].values[0]
+                is_wkd = d.weekday() >= 5
+                
+                sub_profile = profile[profile['Is_Weekend'] == is_wkd]
+                for _, p_row in sub_profile.iterrows():
+                    t = p_row['Time']
+                    ratio = p_row['Ratio']
+                    dt_interval = pd.datetime.combine(d_date, t) if hasattr(pd, 'datetime') else pd.Timestamp.combine(d_date, t)
+                    
+                    reconstructed_rows.append({
+                        'Datetime': dt_interval,
+                        'COF_forecast': daily_val * ratio
+                    })
+                    
+            forecast_cof_final = pd.DataFrame(reconstructed_rows)
+            
+            # Forecast AHT menggunakan Prophet rata-rata harian / tren biasa
+            df_aht_daily = df_aht.groupby(df_aht['Datetime'].dt.date)['AHT_cleansed'].mean().reset_index()
+            df_aht_daily.columns = ['Date', 'AHT']
+            df_aht_daily['Date'] = pd.to_datetime(df_aht_daily['Date'])
+            forecast_aht_daily = run_prophet_daily(df_aht_daily, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
+            
+            # Sebarkan AHT harian secara merata ke interval 30 menit
+            aht_rows = []
+            for d in forecast_dates:
+                d_date = d.date()
+                match_aht = forecast_aht_daily[forecast_aht_daily['Date'] == pd.to_datetime(d_date)]
+                aht_val = match_aht['AHT_daily_forecast'].values[0] if not match_aht.empty else df_aht['AHT_cleansed'].mean()
+                
+                for h in range(24):
+                    for m in [0, 30]:
+                        t = pd.time(h, m)
+                        dt_interval = pd.Timestamp.combine(d_date, t)
+                        aht_rows.append({'Datetime': dt_interval, 'AHT_forecast': aht_val})
+            
+            forecast_aht_final = pd.DataFrame(aht_rows)
+            df_result = pd.merge(forecast_cof_final, forecast_aht_final, on='Datetime')
             df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
+        with st.spinner("Kalkulasi Antrean Erlang C..."):
             df_result['Base_Agent_Needed'] = 0
             df_result['Projected_Wait_Time'] = 0.0
             df_result['Service_Level_Achieved'] = 0.0
@@ -341,7 +406,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         with st.spinner("Mengoptimasi Distribusi Shift (Anti-Cliff/Smoothing) dengan PuLP..."):
             df_shift_dist = optimize_shift_distribution(df_result, active_shifts)
 
-        st.success("🎉 Seluruh Proses Selesai!")
+        st.success("🎉 Seluruh Proses Selesai dengan Profil Intraday 3 Bulan!")
         
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "📊 Forecast & Cleansing", 
@@ -352,14 +417,14 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         ])
         
         with tab1:
-            st.subheader("Prediksi COF (Call Offered)")
+            st.subheader("Prediksi COF (Call Offered) - Berdasarkan Profil Intraday Terbaru")
             st.line_chart(df_result.set_index('Datetime')['COF_forecast'])
             st.subheader("Prediksi AHT (Average Handle Time)")
             st.line_chart(df_result.set_index('Datetime')['AHT_forecast'])
             
         with tab2:
             st.subheader("Ringkasan Kapasitas Bulanan")
-            st.markdown("Kalkulasi Agent sudah dipisahkan menggunakan metode Sizing by Workload (FTE).")
+            st.markdown("Kalkulasi Agent menggunakan metode Sizing by Workload (FTE).")
             c1, c2, c3 = st.columns(3)
             c1.metric("Total COF (1 Bulan)", f"{total_cof_bulan:,}")
             c2.metric("Rata-rata SL Projection", f"{avg_sl_bulan:.2%}")
@@ -381,7 +446,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
         with tab5:
             st.subheader("Matriks Optimal Kebutuhan Slot Shift")
-            st.markdown("Berikut adalah jumlah slot ideal untuk masing-masing shift agar menutupi SLA secara efisien dan **mulus (Smooth Transition)**.")
+            st.markdown("Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan pola jam sibuk 3 bulan terakhir.")
             
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
