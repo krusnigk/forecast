@@ -33,7 +33,6 @@ def optimize_shift_distribution(df_result, master_shifts):
     prev_date = first_date - pd.Timedelta(days=1)
     unique_dates = [prev_date] + list(df_result['Date'].unique())
     
-    # 1. Definisikan Variabel
     shift_vars = {}
     for d in unique_dates:
         shift_vars[d] = {}
@@ -41,10 +40,7 @@ def optimize_shift_distribution(df_result, master_shifts):
             var_name = f"X_{str(d).replace('-','')}_{str(s_code).replace('.','_')}"
             shift_vars[d][s_code] = pulp.LpVariable(var_name, lowBound=0, cat='Integer')
             
-    # 2. Definisikan Variabel Overstaffing
     overstaff_vars = {}
-    
-    # 3. Pemetaan Interval
     interval_coverage = {dt: [] for dt in df_result['Datetime']}
     
     for d in unique_dates:
@@ -52,14 +48,13 @@ def optimize_shift_distribution(df_result, master_shifts):
         for s_code, start_time in master_shifts.items():
             try:
                 start_dt = d_ts + pd.to_timedelta(str(start_time))
-                for i in range(18): # Durasi 9 Jam = 18 interval @ 30 menit
+                for i in range(18): 
                     active_dt = start_dt + pd.Timedelta(minutes=30 * i)
                     if active_dt in interval_coverage:
                         interval_coverage[active_dt].append(shift_vars[d][s_code])
             except Exception:
                 continue 
                     
-    # 4. Fungsi Kendala (Constraint) dengan Slack
     for idx, row in df_result.iterrows():
         dt = row['Datetime']
         req = row['Agent_Needed_Adjust']
@@ -70,14 +65,11 @@ def optimize_shift_distribution(df_result, master_shifts):
             overstaff_vars[dt] = over_var
             prob += pulp.lpSum(active_vars) - over_var == req, f"Cov_{dt.strftime('%Y%m%d_%H%M')}"
             
-    # 5. Fungsi Objektif (Total Agen + Hukuman Overstaffing)
     prob += 100 * pulp.lpSum([shift_vars[d][s] for d in unique_dates for s in master_shifts.keys()]) + \
             1 * pulp.lpSum(overstaff_vars.values()), "Objective_Smooth_Roster"
             
-    # 6. Eksekusi Engine Solver (Diperbaiki menggunakan PULP_CBC_CMD agar aman)
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
     
-    # 7. Ekstraksi Hasil
     results = []
     if pulp.LpStatus[prob.status] == 'Optimal':
         for d in unique_dates:
@@ -145,7 +137,7 @@ def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_resi
     cleansed_series[is_anomaly] = fitted_values[is_anomaly]
     return cleansed_series, is_anomaly
 
-# --- FUNGSI PROPHET UNTUK HARIAN (MACRO FORECAST) ---
+# --- FUNGSI PROPHET UNTUK HARIAN (MACRO FORECAST COF) ---
 @st.cache_data(show_spinner=False)
 def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fcst, use_auto_payday=True):
     df_prophet = pd.DataFrame({
@@ -214,6 +206,78 @@ def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fc
     future_forecast[f'{target_col}_daily_forecast'] = future_forecast[f'{target_col}_daily_forecast'].clip(lower=1)
     
     return future_forecast
+
+# --- FUNGSI PROPHET INTERVAL UNTUK AHT (DINAMIS PER 30 MENIT) ---
+@st.cache_data(show_spinner=False)
+def run_prophet_interval(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto_payday=True):
+    df_prophet = pd.DataFrame({
+        'ds': df_hist['Datetime'],
+        'y': df_hist[f'{target_col}_cleansed']
+    })
+    
+    df_prophet['y'] = df_prophet['y'].replace(0, 1.0)
+    
+    holidays_list = []
+    holiday_dates = []
+    
+    if df_holidays is not None and not df_holidays.empty:
+        if 'Tanggal' in df_holidays.columns:
+            h_df = pd.DataFrame({
+                'holiday': 'libur_nasional',
+                'ds': pd.to_datetime(df_holidays['Tanggal']),
+                'lower_window': 0,
+                'upper_window': 0
+            })
+            holidays_list.append(h_df)
+            holiday_dates = pd.to_datetime(df_holidays['Tanggal']).dt.normalize().tolist()
+            
+    if use_auto_payday:
+        start_date = df_prophet['ds'].min()
+        end_date = pd.to_datetime(end_fcst)
+        dr = pd.date_range(start=start_date, end=end_date)
+        months = dr.to_period('M').unique()
+        
+        paydays = []
+        for m in months:
+            dt_1 = pd.Timestamp(year=m.year, month=m.month, day=1)
+            paydays.append(dt_1)
+            
+            dt_25 = pd.Timestamp(year=m.year, month=m.month, day=25)
+            while dt_25.weekday() >= 5 or dt_25 in holiday_dates:
+                dt_25 -= pd.Timedelta(days=1)
+            paydays.append(dt_25)
+            
+        p_df = pd.DataFrame({
+            'holiday': 'payday',
+            'ds': list(set(paydays)),
+            'lower_window': 0,
+            'upper_window': 0
+        })
+        holidays_list.append(p_df)
+        
+    final_holidays = pd.concat(holidays_list, ignore_index=True) if holidays_list else None
+        
+    model = Prophet(holidays=final_holidays, daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, seasonality_mode='multiplicative')
+    model.fit(df_prophet)
+    
+    last_hist_date = df_prophet['ds'].max()
+    end_fcst_dt = pd.to_datetime(end_fcst) + pd.Timedelta(days=1, minutes=-30)
+    
+    if end_fcst_dt > last_hist_date:
+        delta = end_fcst_dt - last_hist_date
+        periods = int(delta.total_seconds() / 1800)
+    else:
+        periods = 0
+        
+    future = model.make_future_dataframe(periods=periods, freq='30min', include_history=False)
+    forecast = model.predict(future)
+    
+    start_fcst_dt = pd.to_datetime(start_fcst)
+    future_forecast = forecast[(forecast['ds'] >= start_fcst_dt) & (forecast['ds'] <= end_fcst_dt)][['ds', 'yhat']]
+    future_forecast.rename(columns={'ds': 'Datetime', 'yhat': f'{target_col}_forecast'}, inplace=True)
+    future_forecast[f'{target_col}_forecast'] = future_forecast[f'{target_col}_forecast'].clip(lower=1)
+    
+    return future_forecast, 0.0
 
 # --- UI SIDEBAR ---
 st.sidebar.header("📂 1. Upload Database")
@@ -291,7 +355,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
             forecast_cof_daily = run_prophet_daily(df_cof_daily, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
             
-            # 2. Ambil Data Sesuai Pilihan Slider untuk Intraday Profile
+            # 2. Ambil Data Sesuai Pilihan Slider untuk Intraday Profile COF
             max_hist_date = df_cof['Datetime'].max()
             profile_start_date = max_hist_date - pd.DateOffset(months=months_profile)
             df_recent = df_cof[df_cof['Datetime'] >= profile_start_date].copy()
@@ -299,7 +363,6 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_recent['Time'] = df_recent['Datetime'].dt.time
             df_recent['Is_Weekend'] = df_recent['Datetime'].dt.weekday >= 5
             
-            # Hitung total harian pada data recent untuk mendapatkan bobot rasio
             df_recent['Date_Only'] = df_recent['Datetime'].dt.date
             daily_totals = df_recent.groupby(['Date_Only', 'Is_Weekend'])['COF_cleansed'].sum().reset_index()
             daily_totals.rename(columns={'COF_cleansed': 'Daily_Total'}, inplace=True)
@@ -307,14 +370,11 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_recent = pd.merge(df_recent, daily_totals, on=['Date_Only', 'Is_Weekend'])
             df_recent['Ratio'] = df_recent['COF_cleansed'] / df_recent['Daily_Total']
             
-            # Rata-ratakan rasio per Jam (Time) dan jenis hari (Is_Weekend)
             profile = df_recent.groupby(['Is_Weekend', 'Time'])['Ratio'].mean().reset_index()
-            
-            # Normalisasi profil agar totalnya pas 1.0 per tipe hari
             sum_ratios = profile.groupby('Is_Weekend')['Ratio'].transform('sum')
             profile['Ratio'] = profile['Ratio'] / sum_ratios
             
-            # 3. Rekombinasi Macro Harian dengan Profil Intraday
+            # 3. Rekombinasi Macro Harian dengan Profil Intraday COF
             forecast_dates = pd.date_range(start=start_forecast, end=end_forecast)
             reconstructed_rows = []
             
@@ -339,26 +399,9 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                     
             forecast_cof_final = pd.DataFrame(reconstructed_rows)
             
-            # Forecast AHT menggunakan Prophet rata-rata harian
-            df_aht_daily = df_aht.groupby(df_aht['Datetime'].dt.date)['AHT_cleansed'].mean().reset_index()
-            df_aht_daily.columns = ['Date', 'AHT']
-            df_aht_daily['Date'] = pd.to_datetime(df_aht_daily['Date'])
-            forecast_aht_daily = run_prophet_daily(df_aht_daily, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
+            # 4. Forecast AHT Kembali Menggunakan Interval-Level Prophet (Dinamis per 30 Menit)
+            forecast_aht_final, _ = run_prophet_interval(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
             
-            # Sebarkan AHT harian secara merata ke interval 30 menit (Menggunakan datetime.time)
-            aht_rows = []
-            for d in forecast_dates:
-                d_date = d.date()
-                match_aht = forecast_aht_daily[forecast_aht_daily['Date'] == pd.to_datetime(d_date)]
-                aht_val = match_aht['AHT_daily_forecast'].values[0] if not match_aht.empty else df_aht['AHT_cleansed'].mean()
-                
-                for h in range(24):
-                    for m in [0, 30]:
-                        t = datetime.time(h, m)
-                        dt_interval = pd.Timestamp.combine(d_date, t)
-                        aht_rows.append({'Datetime': dt_interval, 'AHT_forecast': aht_val})
-            
-            forecast_aht_final = pd.DataFrame(aht_rows)
             df_result = pd.merge(forecast_cof_final, forecast_aht_final, on='Datetime')
             df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
@@ -410,7 +453,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         with st.spinner("Mengoptimasi Distribusi Shift (Anti-Cliff/Smoothing) dengan PuLP..."):
             df_shift_dist = optimize_shift_distribution(df_result, active_shifts)
 
-        st.success("🎉 Seluruh Proses Selesai dengan Profil Intraday Dinamis!")
+        st.success("🎉 Seluruh Proses Selesai!")
         
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "📊 Forecast & Cleansing", 
@@ -423,7 +466,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         with tab1:
             st.subheader("Prediksi COF (Call Offered) - Berdasarkan Profil Intraday Terbaru")
             st.line_chart(df_result.set_index('Datetime')['COF_forecast'])
-            st.subheader("Prediksi AHT (Average Handle Time)")
+            st.subheader("Prediksi AHT (Average Handle Time) - Dinamis per Interval")
             st.line_chart(df_result.set_index('Datetime')['AHT_forecast'])
             
         with tab2:
