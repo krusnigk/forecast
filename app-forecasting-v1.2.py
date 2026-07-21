@@ -24,7 +24,7 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI OPTIMASI SHIFT (PULP) DENGAN KONTROL ANTI-CLIFF ---
+# --- FUNGSI OPTIMASI SHIFT (PULP) DENGAN SOFT CONSTRAINTS (ANTI-INFEASIBLE) ---
 @st.cache_data(show_spinner=False)
 def optimize_shift_distribution(df_result, master_shifts):
     prob = pulp.LpProblem("Shift_Optimization", pulp.LpMinimize)
@@ -38,10 +38,11 @@ def optimize_shift_distribution(df_result, master_shifts):
         shift_vars[d] = {}
         for s_code in master_shifts.keys():
             var_name = f"X_{str(d).replace('-','')}_{str(s_code).replace('.','_')}"
-            # Batasi agar setiap slot shift tunggal tidak mengambil alokasi ekstrem (> 30 agen)
-            shift_vars[d][s_code] = pulp.LpVariable(var_name, lowBound=0, upBound=30, cat='Integer')
+            # Tanpa batasan hard-cap kaku agar solver fleksibel menemukan kombinasi terbaik
+            shift_vars[d][s_code] = pulp.LpVariable(var_name, lowBound=0, cat='Integer')
             
     overstaff_vars = {}
+    understaff_vars = {}
     interval_coverage = {dt: [] for dt in df_result['Datetime']}
     
     for d in unique_dates:
@@ -56,6 +57,7 @@ def optimize_shift_distribution(df_result, master_shifts):
             except Exception:
                 continue 
                     
+    # Menerapkan Soft Constraints pada setiap interval
     for idx, row in df_result.iterrows():
         dt = row['Datetime']
         req = row['Agent_Needed_Adjust']
@@ -63,35 +65,32 @@ def optimize_shift_distribution(df_result, master_shifts):
         
         if active_vars:
             over_var = pulp.LpVariable(f"Over_{dt.strftime('%Y%m%d_%H%M')}", lowBound=0)
+            under_var = pulp.LpVariable(f"Under_{dt.strftime('%Y%m%d_%H%M')}", lowBound=0)
             overstaff_vars[dt] = over_var
-            prob += pulp.lpSum(active_vars) - over_var == req, f"Cov_{dt.strftime('%Y%m%d_%H%M')}"
+            understaff_vars[dt] = under_var
             
-    # Tambahan Kendala Proporsi Shift Pagi (Mencegah S1 & S2 menumpuk berlebihan di awal)
-    for d in unique_dates:
-        if d in shift_vars:
-            if 'S1' in shift_vars[d] and 'S2' in shift_vars[d]:
-                prob += shift_vars[d]['S1'] <= 15, f"Max_S1_{str(d)}"
-                prob += shift_vars[d]['S2'] <= 15, f"Max_S2_{str(d)}"
-
-    # Fungsi Objektif dengan Penalti Overstaffing
-    prob += 100 * pulp.lpSum([shift_vars[d][s] for d in unique_dates for s in master_shifts.keys()]) + \
-            5 * pulp.lpSum(overstaff_vars.values()), "Objective_Smooth_Roster"
+            # Active + Under - Over == Req (Memungkinkan solver mencari solusi tanpa crash)
+            prob += pulp.lpSum(active_vars) + under_var - over_var == req, f"Cov_{dt.strftime('%Y%m%d_%H%M')}"
+            
+    # Fungsi Objektif Seimbang (Minimalkan total agen, cegah kekurangan drastis, ratakan kelebihan)
+    prob += 1000 * pulp.lpSum([shift_vars[d][s] for d in unique_dates for s in master_shifts.keys()]) + \
+            50000 * pulp.lpSum(understaff_vars.values()) + \
+            1 * pulp.lpSum(overstaff_vars.values()), "Objective_Realistic_Distribution"
             
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
     
     results = []
-    if pulp.LpStatus[prob.status] == 'Optimal':
-        for d in unique_dates:
-            row_res = {'Tanggal': d}
-            total = 0
-            for s_code in master_shifts.keys():
-                val = int(shift_vars[d][s_code].varValue)
-                row_res[s_code] = val
-                total += val
-            row_res['Total_Agent_Shift'] = total
-            if d == prev_date and total == 0:
-                continue
-            results.append(row_res)
+    for d in unique_dates:
+        row_res = {'Tanggal': d}
+        total = 0
+        for s_code in master_shifts.keys():
+            val = int(shift_vars[d][s_code].varValue)
+            row_res[s_code] = val
+            total += val
+        row_res['Total_Agent_Shift'] = total
+        if d == prev_date and total == 0:
+            continue
+        results.append(row_res)
     return pd.DataFrame(results)
 
 # --- FUNGSI ERLANG C ITERATIF ---
@@ -459,7 +458,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL']]
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
-        with st.spinner("Mengoptimasi Distribusi Shift (Anti-Cliff/Smoothing) dengan PuLP..."):
+        with st.spinner("Mengoptimasi Distribusi Shift (Soft-Constraint Smoothing) dengan PuLP..."):
             df_shift_dist = optimize_shift_distribution(df_result, active_shifts)
 
         st.success("🎉 Seluruh Proses Selesai!")
@@ -502,7 +501,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
         with tab5:
             st.subheader("Matriks Optimal Kebutuhan Slot Shift")
-            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan profil pola jam sibuk {months_profile} bulan terakhir (Anti-Stacking Shift Pagi).")
+            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan profil pola jam sibuk {months_profile} bulan terakhir (Model Soft-Constraints Realistis).")
             
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
