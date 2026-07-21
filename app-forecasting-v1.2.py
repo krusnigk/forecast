@@ -4,6 +4,7 @@ import numpy as np
 import math
 import io
 import pulp
+import datetime
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.metrics import mean_absolute_percentage_error
@@ -329,7 +330,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 for _, p_row in sub_profile.iterrows():
                     t = p_row['Time']
                     ratio = p_row['Ratio']
-                    dt_interval = pd.datetime.combine(d_date, t) if hasattr(pd, 'datetime') else pd.Timestamp.combine(d_date, t)
+                    dt_interval = pd.Timestamp.combine(d_date, t)
                     
                     reconstructed_rows.append({
                         'Datetime': dt_interval,
@@ -344,7 +345,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_aht_daily['Date'] = pd.to_datetime(df_aht_daily['Date'])
             forecast_aht_daily = run_prophet_daily(df_aht_daily, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
             
-            # Sebarkan AHT harian secara merata ke interval 30 menit
+            # Sebarkan AHT harian secara merata ke interval 30 menit (Menggunakan datetime.time)
             aht_rows = []
             for d in forecast_dates:
                 d_date = d.date()
@@ -353,7 +354,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 
                 for h in range(24):
                     for m in [0, 30]:
-                        t = pd.time(h, m)
+                        t = datetime.time(h, m)
                         dt_interval = pd.Timestamp.combine(d_date, t)
                         aht_rows.append({'Datetime': dt_interval, 'AHT_forecast': aht_val})
             
