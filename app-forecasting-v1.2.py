@@ -23,7 +23,7 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI OPTIMASI SHIFT (PULP) DENGAN CACHING ---
+# --- FUNGSI OPTIMASI SHIFT (PULP) DENGAN CACHING & SMOOTHING ---
 @st.cache_data(show_spinner=False)
 def optimize_shift_distribution(df_result, master_shifts):
     prob = pulp.LpProblem("Shift_Optimization", pulp.LpMinimize)
@@ -40,8 +40,8 @@ def optimize_shift_distribution(df_result, master_shifts):
             var_name = f"X_{str(d).replace('-','')}_{str(s_code).replace('.','_')}"
             shift_vars[d][s_code] = pulp.LpVariable(var_name, lowBound=0, cat='Integer')
             
-    # 2. Fungsi Objektif
-    prob += pulp.lpSum([shift_vars[d][s] for d in unique_dates for s in master_shifts.keys()]), "Total_Agents"
+    # 2. Definisikan Variabel Overstaffing
+    overstaff_vars = {}
     
     # 3. Pemetaan Interval
     interval_coverage = {dt: [] for dt in df_result['Datetime']}
@@ -58,18 +58,25 @@ def optimize_shift_distribution(df_result, master_shifts):
             except Exception:
                 continue 
                     
-    # 4. Fungsi Kendala (Constraint)
+    # 4. Fungsi Kendala (Constraint) dengan Slack
     for idx, row in df_result.iterrows():
         dt = row['Datetime']
         req = row['Agent_Needed_Adjust']
         active_vars = interval_coverage.get(dt, [])
+        
         if active_vars:
-            prob += pulp.lpSum(active_vars) >= req, f"Cov_{dt.strftime('%Y%m%d_%H%M')}"
+            over_var = pulp.LpVariable(f"Over_{dt.strftime('%Y%m%d_%H%M')}", lowBound=0)
+            overstaff_vars[dt] = over_var
+            prob += pulp.lpSum(active_vars) - over_var == req, f"Cov_{dt.strftime('%Y%m%d_%H%M')}"
             
-    # 5. Eksekusi Engine Solver
+    # 5. Fungsi Objektif (Total Agen + Hukuman Overstaffing)
+    prob += 100 * pulp.lpSum([shift_vars[d][s] for d in unique_dates for s in master_shifts.keys()]) + \
+            1 * pulp.lpSum(overstaff_vars.values()), "Objective_Smooth_Roster"
+            
+    # 6. Eksekusi Engine Solver
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
     
-    # 6. Ekstraksi Hasil
+    # 7. Ekstraksi Hasil
     results = []
     if pulp.LpStatus[prob.status] == 'Optimal':
         for d in unique_dates:
@@ -208,7 +215,9 @@ def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto
     start_fcst_dt = pd.to_datetime(start_fcst)
     future_forecast = forecast[(forecast['ds'] >= start_fcst_dt) & (forecast['ds'] <= end_fcst_dt)][['ds', 'yhat']]
     future_forecast.rename(columns={'ds': 'Datetime', 'yhat': f'{target_col}_forecast'}, inplace=True)
-    future_forecast[f'{target_col}_forecast'] = future_forecast[f'{target_col}_forecast'].clip(lower=0)
+    
+    # Menghindari COF Forecast = 0 murni agar grafik tetap estetik
+    future_forecast[f'{target_col}_forecast'] = future_forecast[f'{target_col}_forecast'].clip(lower=0.1)
     
     return future_forecast, mape
 
@@ -329,7 +338,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL']]
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
-        with st.spinner("Mengoptimasi Distribusi Shift dengan PuLP (Linear Programming)..."):
+        with st.spinner("Mengoptimasi Distribusi Shift (Anti-Cliff/Smoothing) dengan PuLP..."):
             df_shift_dist = optimize_shift_distribution(df_result, active_shifts)
 
         st.success("🎉 Seluruh Proses Selesai!")
@@ -372,13 +381,12 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
         with tab5:
             st.subheader("Matriks Optimal Kebutuhan Slot Shift")
-            st.markdown("Berikut adalah jumlah slot ideal untuk masing-masing shift agar menutupi SLA secara efisien selama 24 jam penuh.")
+            st.markdown("Berikut adalah jumlah slot ideal untuk masing-masing shift agar menutupi SLA secara efisien dan **mulus (Smooth Transition)**.")
             
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
                 
                 st.markdown("#### Visualisasi Proporsi Shift Harian")
-                # Pre-processing untuk Bar Chart (Drop Total Column)
                 df_chart = df_shift_dist.set_index('Tanggal').drop(columns=['Total_Agent_Shift'])
                 st.bar_chart(df_chart)
             else:
