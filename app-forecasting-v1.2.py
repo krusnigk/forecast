@@ -228,7 +228,10 @@ shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=10
 work_hours = st.sidebar.number_input("Jam Kerja per Hari (Untuk FTE)", value=8)
 work_days = st.sidebar.number_input("Hari Kerja/Agen/Bulan", value=22)
 
-st.sidebar.header("📅 3. Konfigurasi Tanggal")
+st.sidebar.header("📊 3. Profil Intraday Interval")
+months_profile = st.sidebar.slider("Gunakan Profil Interval (Bulan Terakhir)", min_value=1, max_value=12, value=3, help="Rentang waktu historis untuk mengambil pola jam sibuk intraday.")
+
+st.sidebar.header("📅 4. Konfigurasi Tanggal")
 start_hist = st.sidebar.date_input("Mulai Data Historis", pd.to_datetime('2024-02-01'))
 end_hist = st.sidebar.date_input("Akhir Data Historis", pd.to_datetime('2026-05-25'))
 start_forecast = st.sidebar.date_input("Mulai Forecast", pd.to_datetime('2026-06-01'))
@@ -276,7 +279,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof = df_cof[(df_cof['Datetime'] >= pd.to_datetime(start_hist)) & (df_cof['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             df_aht = df_aht[(df_aht['Datetime'] >= pd.to_datetime(start_hist)) & (df_aht['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             
-        with st.spinner("Melatih Model AI & Menerapkan 3-Month Intraday Profiling..."):
+        with st.spinner(f"Melatih Model AI & Menerapkan Intraday Profiling ({months_profile} Bulan Terakhir)..."):
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
             
@@ -287,10 +290,10 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
             forecast_cof_daily = run_prophet_daily(df_cof_daily, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
             
-            # 2. Ambil 3 Bulan Terakhir dari Data Historis untuk Intraday Profile
+            # 2. Ambil Data Sesuai Pilihan Slider untuk Intraday Profile
             max_hist_date = df_cof['Datetime'].max()
-            three_months_ago = max_hist_date - pd.DateOffset(months=3)
-            df_recent = df_cof[df_cof['Datetime'] >= three_months_ago].copy()
+            profile_start_date = max_hist_date - pd.DateOffset(months=months_profile)
+            df_recent = df_cof[df_cof['Datetime'] >= profile_start_date].copy()
             
             df_recent['Time'] = df_recent['Datetime'].dt.time
             df_recent['Is_Weekend'] = df_recent['Datetime'].dt.weekday >= 5
@@ -310,7 +313,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             sum_ratios = profile.groupby('Is_Weekend')['Ratio'].transform('sum')
             profile['Ratio'] = profile['Ratio'] / sum_ratios
             
-            # 3. Rekombinasi Macro Harian dengan Profil Intraday 3 Bulan
+            # 3. Rekombinasi Macro Harian dengan Profil Intraday
             forecast_dates = pd.date_range(start=start_forecast, end=end_forecast)
             reconstructed_rows = []
             
@@ -335,7 +338,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                     
             forecast_cof_final = pd.DataFrame(reconstructed_rows)
             
-            # Forecast AHT menggunakan Prophet rata-rata harian / tren biasa
+            # Forecast AHT menggunakan Prophet rata-rata harian
             df_aht_daily = df_aht.groupby(df_aht['Datetime'].dt.date)['AHT_cleansed'].mean().reset_index()
             df_aht_daily.columns = ['Date', 'AHT']
             df_aht_daily['Date'] = pd.to_datetime(df_aht_daily['Date'])
@@ -406,7 +409,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         with st.spinner("Mengoptimasi Distribusi Shift (Anti-Cliff/Smoothing) dengan PuLP..."):
             df_shift_dist = optimize_shift_distribution(df_result, active_shifts)
 
-        st.success("🎉 Seluruh Proses Selesai dengan Profil Intraday 3 Bulan!")
+        st.success("🎉 Seluruh Proses Selesai dengan Profil Intraday Dinamis!")
         
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "📊 Forecast & Cleansing", 
@@ -446,7 +449,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
         with tab5:
             st.subheader("Matriks Optimal Kebutuhan Slot Shift")
-            st.markdown("Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan pola jam sibuk 3 bulan terakhir.")
+            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan profil pola jam sibuk {months_profile} bulan terakhir.")
             
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
