@@ -23,7 +23,8 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI OPTIMASI SHIFT (PULP) ---
+# --- FUNGSI OPTIMASI SHIFT (PULP) DENGAN CACHING ---
+@st.cache_data(show_spinner=False)
 def optimize_shift_distribution(df_result, master_shifts):
     prob = pulp.LpProblem("Shift_Optimization", pulp.LpMinimize)
     
@@ -49,15 +50,13 @@ def optimize_shift_distribution(df_result, master_shifts):
         d_ts = pd.to_datetime(d)
         for s_code, start_time in master_shifts.items():
             try:
-                # Memastikan format waktu bisa dibaca oleh Pandas
                 start_dt = d_ts + pd.to_timedelta(str(start_time))
-                # Durasi 9 Jam = 18 interval x 30 menit
-                for i in range(18):
+                for i in range(18): # Durasi 9 Jam = 18 interval @ 30 menit
                     active_dt = start_dt + pd.Timedelta(minutes=30 * i)
                     if active_dt in interval_coverage:
                         interval_coverage[active_dt].append(shift_vars[d][s_code])
             except Exception:
-                continue # Mengabaikan baris jika format waktu tidak valid
+                continue 
                     
     # 4. Fungsi Kendala (Constraint)
     for idx, row in df_result.iterrows():
@@ -84,10 +83,10 @@ def optimize_shift_distribution(df_result, master_shifts):
             if d == prev_date and total == 0:
                 continue
             results.append(row_res)
-            
     return pd.DataFrame(results)
 
 # --- FUNGSI ERLANG C ITERATIF ---
+@st.cache_data(show_spinner=False)
 def erlang_c_prob(agents, traffic):
     if agents <= traffic:
         return 1.0
@@ -98,6 +97,7 @@ def erlang_c_prob(agents, traffic):
     erlang_c = erlang_b / (1.0 - (traffic / agents) * (1.0 - erlang_b))
     return max(0.0, min(1.0, erlang_c))
 
+@st.cache_data(show_spinner=False)
 def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time):
     if pd.isna(cof) or pd.isna(aht_seconds) or cof <= 0:
         return 0, 0.0, 1.0
@@ -123,7 +123,8 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time):
         
     return agents, asa, sl
 
-# --- FUNGSI CLEANSING HOLT-WINTERS ---
+# --- FUNGSI CLEANSING HOLT-WINTERS DENGAN CACHING ---
+@st.cache_data(show_spinner=False)
 def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_residual=15):
     series = df[target_col].ffill().bfill()
     model = ExponentialSmoothing(series, trend='add', seasonal='add', seasonal_periods=seasonal_periods, initialization_method="estimated")
@@ -136,7 +137,8 @@ def cleanse_data_hw(df, target_col, seasonal_periods=48, threshold=2.0, min_resi
     cleansed_series[is_anomaly] = fitted_values[is_anomaly]
     return cleansed_series, is_anomaly
 
-# --- FUNGSI FORECAST PROPHET ---
+# --- FUNGSI FORECAST PROPHET DENGAN CACHING ---
+@st.cache_data(show_spinner=False)
 def run_prophet(df_hist, df_holidays, target_col, start_fcst, end_fcst, use_auto_payday=True):
     df_prophet = pd.DataFrame({
         'ds': df_hist['Datetime'],
@@ -242,19 +244,26 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             try:
                 df_s = pd.read_csv(file_shift) if file_shift.name.endswith('csv') else pd.read_excel(file_shift)
                 if 'Kode_Shift' in df_s.columns and 'Waktu_Mulai' in df_s.columns:
-                    # Mengkonversi ke dictionary dinamis
                     df_s['Waktu_Mulai'] = df_s['Waktu_Mulai'].astype(str)
                     active_shifts = dict(zip(df_s['Kode_Shift'], df_s['Waktu_Mulai']))
                     st.toast("✅ Master Shift kustom berhasil dimuat!", icon="🧩")
                 else:
                     st.warning("Kolom 'Kode_Shift' atau 'Waktu_Mulai' tidak ditemukan. Menggunakan Shift Default.")
             except Exception as e:
-                st.warning(f"Gagal membaca file Shift, menggunakan Shift Default. Error: {e}")
+                st.warning(f"Gagal membaca file Shift. Error: {e}")
                 
-        with st.spinner("Memproses cleansing, payday, dan forecasting. Mohon tunggu..."):
+        with st.spinner("Memvalidasi dan Membaca Data Historis..."):
             df_cof = pd.read_csv(file_cof) if file_cof.name.endswith('csv') else pd.read_excel(file_cof)
             df_aht = pd.read_csv(file_aht) if file_aht.name.endswith('csv') else pd.read_excel(file_aht)
             
+            # VALIDASI KOLOM (ERROR HANDLING)
+            if not {'Datetime', 'COF'}.issubset(df_cof.columns):
+                st.error("❌ Format Gagal! File COF wajib memiliki kolom 'Datetime' dan 'COF'.")
+                st.stop()
+            if not {'Datetime', 'AHT'}.issubset(df_aht.columns):
+                st.error("❌ Format Gagal! File AHT wajib memiliki kolom 'Datetime' dan 'AHT'.")
+                st.stop()
+                
             df_holidays = None
             if file_holidays:
                 df_holidays = pd.read_csv(file_holidays) if file_holidays.name.endswith('csv') else pd.read_excel(file_holidays)
@@ -265,14 +274,15 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof = df_cof[(df_cof['Datetime'] >= pd.to_datetime(start_hist)) & (df_cof['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             df_aht = df_aht[(df_aht['Datetime'] >= pd.to_datetime(start_hist)) & (df_aht['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             
+        with st.spinner("Melatih Model AI (Cleansing & Prophet Forecast)..."):
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
             
             forecast_cof, mape_cof = run_prophet(df_cof, df_holidays, 'COF', start_forecast, end_forecast, use_auto_payday=use_payday)
             forecast_aht, mape_aht = run_prophet(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
             
+        with st.spinner("Kalkulasi Antrean Erlang C..."):
             df_result = pd.merge(forecast_cof, forecast_aht, on='Datetime')
-            
             df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
             df_result['Base_Agent_Needed'] = 0
@@ -319,10 +329,10 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL']]
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
-        with st.spinner("Mengoptimasi Slot Shift 24 Jam dengan PuLP. Mohon tunggu..."):
+        with st.spinner("Mengoptimasi Distribusi Shift dengan PuLP (Linear Programming)..."):
             df_shift_dist = optimize_shift_distribution(df_result, active_shifts)
 
-        st.success("Seluruh Proses Selesai!")
+        st.success("🎉 Seluruh Proses Selesai!")
         
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "📊 Forecast & Cleansing", 
@@ -363,10 +373,16 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         with tab5:
             st.subheader("Matriks Optimal Kebutuhan Slot Shift")
             st.markdown("Berikut adalah jumlah slot ideal untuk masing-masing shift agar menutupi SLA secara efisien selama 24 jam penuh.")
+            
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
+                
+                st.markdown("#### Visualisasi Proporsi Shift Harian")
+                # Pre-processing untuk Bar Chart (Drop Total Column)
+                df_chart = df_shift_dist.set_index('Tanggal').drop(columns=['Total_Agent_Shift'])
+                st.bar_chart(df_chart)
             else:
-                st.error("Gagal melakukan optimasi shift. Periksa kembali batasan data Anda.")
+                st.warning("⚠️ Sistem tidak dapat menemukan kombinasi shift yang menutupi seluruh SLA (Infeasible). Coba tambahkan variasi kode shift malam atau kurangi Target SL.")
 
         # Tombol Download Excel
         st.write("---")
@@ -385,4 +401,4 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         )
 
     else:
-        st.error("Mohon unggah file COF dan AHT terlebih dahulu.")
+        st.info("Silakan unggah file COF dan AHT di Sidebar untuk memulai simulasi.")
