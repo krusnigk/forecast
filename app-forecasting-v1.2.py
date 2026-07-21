@@ -24,7 +24,7 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI OPTIMASI SHIFT (PULP) DENGAN CACHING & SMOOTHING ---
+# --- FUNGSI OPTIMASI SHIFT (PULP) DENGAN KONTROL ANTI-CLIFF ---
 @st.cache_data(show_spinner=False)
 def optimize_shift_distribution(df_result, master_shifts):
     prob = pulp.LpProblem("Shift_Optimization", pulp.LpMinimize)
@@ -38,7 +38,8 @@ def optimize_shift_distribution(df_result, master_shifts):
         shift_vars[d] = {}
         for s_code in master_shifts.keys():
             var_name = f"X_{str(d).replace('-','')}_{str(s_code).replace('.','_')}"
-            shift_vars[d][s_code] = pulp.LpVariable(var_name, lowBound=0, cat='Integer')
+            # Batasi agar setiap slot shift tunggal tidak mengambil alokasi ekstrem (> 30 agen)
+            shift_vars[d][s_code] = pulp.LpVariable(var_name, lowBound=0, upBound=30, cat='Integer')
             
     overstaff_vars = {}
     interval_coverage = {dt: [] for dt in df_result['Datetime']}
@@ -65,8 +66,16 @@ def optimize_shift_distribution(df_result, master_shifts):
             overstaff_vars[dt] = over_var
             prob += pulp.lpSum(active_vars) - over_var == req, f"Cov_{dt.strftime('%Y%m%d_%H%M')}"
             
+    # Tambahan Kendala Proporsi Shift Pagi (Mencegah S1 & S2 menumpuk berlebihan di awal)
+    for d in unique_dates:
+        if d in shift_vars:
+            if 'S1' in shift_vars[d] and 'S2' in shift_vars[d]:
+                prob += shift_vars[d]['S1'] <= 15, f"Max_S1_{str(d)}"
+                prob += shift_vars[d]['S2'] <= 15, f"Max_S2_{str(d)}"
+
+    # Fungsi Objektif dengan Penalti Overstaffing
     prob += 100 * pulp.lpSum([shift_vars[d][s] for d in unique_dates for s in master_shifts.keys()]) + \
-            1 * pulp.lpSum(overstaff_vars.values()), "Objective_Smooth_Roster"
+            5 * pulp.lpSum(overstaff_vars.values()), "Objective_Smooth_Roster"
             
     prob.solve(pulp.PULP_CBC_CMD(msg=False))
     
@@ -399,7 +408,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                     
             forecast_cof_final = pd.DataFrame(reconstructed_rows)
             
-            # 4. Forecast AHT Kembali Menggunakan Interval-Level Prophet (Dinamis per 30 Menit)
+            # 4. Forecast AHT Menggunakan Interval-Level Prophet (Dinamis per 30 Menit)
             forecast_aht_final, _ = run_prophet_interval(df_aht, df_holidays, 'AHT', start_forecast, end_forecast, use_auto_payday=use_payday)
             
             df_result = pd.merge(forecast_cof_final, forecast_aht_final, on='Datetime')
@@ -493,7 +502,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
         with tab5:
             st.subheader("Matriks Optimal Kebutuhan Slot Shift")
-            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan profil pola jam sibuk {months_profile} bulan terakhir.")
+            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift berdasarkan profil pola jam sibuk {months_profile} bulan terakhir (Anti-Stacking Shift Pagi).")
             
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
