@@ -23,7 +23,7 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI ALOKASI SHIFT BERTAHAP DENGAN KONTROL SHIFT MALAM ---
+# --- FUNGSI ALOKASI SHIFT BERTAHAP (CONTROLLED INCREMENTAL ALLOCATOR) ---
 @st.cache_data(show_spinner=False)
 def optimize_shift_distribution(df_result, master_shifts):
     shift_items = []
@@ -434,7 +434,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_daily_display['Max_Kebutuhan_Agent'] = df_daily_display['Max_Kebutuhan_Agent'].astype(int)
             df_daily_display['Rata_Rata_SL'] = df_daily_display['Rata_Rata_SL'].apply(lambda x: f"{x:.2%}")
             
-            df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']]
+            df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL']]
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
         with st.spinner("Menjalankan Alokasi Shift Stabil (Controlled Incremental Allocator)..."):
