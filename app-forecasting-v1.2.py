@@ -345,9 +345,9 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof = df_cof[(df_cof['Datetime'] >= pd.to_datetime(start_hist)) & (df_cof['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             df_aht = df_aht[(df_aht['Datetime'] >= pd.to_datetime(start_hist)) & (df_aht['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             
-            # --- IMPROVEMENT: PRE-PROCESSING RESAMPLING (Mencegah Missing Interval) ---
-            df_cof = df_cof.set_index('Datetime').resample('30T').asfreq().fillna(0).reset_index()
-            df_aht = df_aht.set_index('Datetime').resample('30T').asfreq().fillna(0).reset_index()
+            # --- PERBAIKAN: PRE-PROCESSING RESAMPLING (Menggunakan standar frekuensi baru '30min') ---
+            df_cof = df_cof.set_index('Datetime').resample('30min').asfreq().fillna(0).reset_index()
+            df_aht = df_aht.set_index('Datetime').resample('30min').asfreq().fillna(0).reset_index()
 
         with st.spinner(f"Melatih Model AI & Menerapkan Intraday Profiling ({months_profile} Bulan Terakhir)..."):
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
