@@ -52,12 +52,12 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
         shift_vars = {s_code: pulp.LpVariable(f"{s_code}", lowBound=0, cat='Integer') for s_code in shift_items.keys()}
         
         surplus_vars = []
-        shortage_vars = [] # Variabel untuk mengizinkan SL Drop (Kekurangan Agent)
+        shortage_vars = [] 
         
         for _, row in df_day.iterrows():
             dt = row['Datetime']
             
-            # 1. PERUBAHAN KRUSIAL: Target kini menggunakan Kebutuhan Murni Tanpa Shrinkage
+            # Target menggunakan Kebutuhan Murni Tanpa Shrinkage
             req = row['Base_Agent_Needed'] 
             
             active_shifts_in_interval = []
@@ -79,14 +79,10 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
             surplus_vars.append(surplus)
             shortage_vars.append(shortage)
             
-            # 2. SOFT CONSTRAINT: Agent Duty + Kekurangan - Kelebihan = Target Murni
-            # Algoritma diizinkan untuk "kekurangan" asal membayar penalti di fungsi objektif
+            # SOFT CONSTRAINT: Agent Duty + Kekurangan - Kelebihan = Target Murni
             prob += pulp.lpSum(active_shifts_in_interval) + shortage - surplus == req, f"Req_{interval_str}"
             
-        # 3. FUNGSI OBJEKTIF DINAMIS:
-        # - Biaya 1.0 = Untuk menambah 1 agent (shift penuh)
-        # - Biaya 0.15 = Penalti per interval jika understaff (membiarkan SL merah/shortage)
-        # - Biaya 0.01 = Penalti per interval jika overstaff (memaksa jadwal tetap mepet/smooth)
+        # FUNGSI OBJEKTIF DINAMIS
         prob += pulp.lpSum([shift_vars[s_code] for s_code in shift_items.keys()]) + \
                 0.15 * pulp.lpSum(shortage_vars) + \
                 0.01 * pulp.lpSum(surplus_vars)
@@ -338,6 +334,11 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         with st.spinner("Memvalidasi, Membaca, & Pre-processing Data Historis..."):
             df_cof = pd.read_csv(file_cof) if file_cof.name.endswith('csv') else pd.read_excel(file_cof)
             df_aht = pd.read_csv(file_aht) if file_aht.name.endswith('csv') else pd.read_excel(file_aht)
+            
+            # ---> PENAMBAHAN KEMBALI BLOK INISIALISASI HOLIDAYS <---
+            df_holidays = None
+            if file_holidays is not None:
+                df_holidays = pd.read_csv(file_holidays) if file_holidays.name.endswith('csv') else pd.read_excel(file_holidays)
             
             df_cof['Datetime'] = pd.to_datetime(df_cof['Datetime'])
             df_aht['Datetime'] = pd.to_datetime(df_aht['Datetime'])
