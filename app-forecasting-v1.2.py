@@ -6,9 +6,15 @@ import io
 import datetime
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
-from sklearn.metrics import mean_absolute_percentage_error
 import warnings
+import logging
+from functools import lru_cache
+import pulp  # Library untuk Linear Programming
+
+# --- SUPPRESS WARNINGS & PROPHET LOGS ---
 warnings.filterwarnings('ignore')
+logging.getLogger('prophet').setLevel(logging.WARNING)
+logging.getLogger('cmdstanpy').disabled = True
 
 # --- KONFIGURASI HALAMAN ---
 st.set_page_config(page_title="WFM Forecast & Capacity Planner", layout="wide")
@@ -23,55 +29,57 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI ALOKASI SHIFT BERTAHAP (CONTROLLED INCREMENTAL ALLOCATOR) ---
+# --- FUNGSI ALOKASI SHIFT DENGAN LINEAR PROGRAMMING (PULP) ---
 @st.cache_data(show_spinner=False)
-def optimize_shift_distribution(df_result, master_shifts):
-    shift_items = []
+def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_hours=9):
+    shift_items = {}
     for s_code, s_time in master_shifts.items():
-        t_obj = pd.to_timedelta(str(s_time))
-        shift_items.append((s_code, t_obj))
-    shift_items.sort(key=lambda x: x[1])
-    
+        shift_items[s_code] = pd.to_timedelta(str(s_time))
+        
     results = []
     unique_dates = df_result['Date'].unique()
     
     for d in unique_dates:
         df_day = df_result[df_result['Date'] == d].sort_values('Datetime').copy()
-        day_shifts = {s[0]: 0 for s in shift_items}
-        d_ts = pd.to_datetime(d)
         
+        # 1. Inisialisasi Model LP untuk Hari Tersebut (Tujuan: Minimalisasi)
+        prob = pulp.LpProblem(f"Shift_Allocation_{d}", pulp.LpMinimize)
+        
+        # 2. Definisikan Variabel Keputusan (Jumlah agent di tiap shift, harus bilangan bulat >= 0)
+        shift_vars = {s_code: pulp.LpVariable(f"{s_code}", lowBound=0, cat='Integer') for s_code in shift_items.keys()}
+        
+        # 3. Fungsi Objektif: Minimalkan Total Agent Harian
+        prob += pulp.lpSum([shift_vars[s_code] for s_code in shift_items.keys()])
+        
+        # 4. Constraints (Batasan): Kebutuhan Agent Tiap Interval Harus Terpenuhi
         for _, row in df_day.iterrows():
             dt = row['Datetime']
             req = row['Agent_Needed_Adjust']
             
-            current_active = 0
-            for s_code, count in day_shifts.items():
-                s_td = dict(shift_items)[s_code]
-                start_dt = d_ts + s_td
-                end_dt = start_dt + pd.Timedelta(hours=9)
-                if start_dt <= dt < end_dt:
-                    current_active += count
+            active_shifts_in_interval = []
             
-            if current_active < req:
-                deficit = req - current_active
-                eligible_shifts = [(s_code, s_td) for s_code, s_td in shift_items if (d_ts + s_td) <= dt]
-                if not eligible_shifts:
-                    eligible_shifts = shift_items
+            for s_code, s_start_td in shift_items.items():
+                shift_start_dt = pd.to_datetime(d) + s_start_td
+                shift_end_dt = shift_start_dt + pd.Timedelta(hours=shift_duration_hours)
                 
-                best_shift = max(eligible_shifts, key=lambda x: x[1])[0]
-                
-                if best_shift in ['S11', 'S19', 'S20'] and day_shifts[best_shift] >= 12:
-                    other_shifts = [s for s in eligible_shifts if s[0] not in ['S11', 'S19', 'S20']]
-                    if other_shifts:
-                        best_shift = max(other_shifts, key=lambda x: x[1])[0]
-                
-                increment = min(deficit, max(1, math.ceil(deficit / 2)))
-                day_shifts[best_shift] += increment
-                
+                # Cek jika shift aktif di interval ini (Tumpang tindih antar shift otomatis ditangani)
+                if shift_start_dt <= dt < shift_end_dt:
+                    active_shifts_in_interval.append(shift_vars[s_code])
+                # Menangani shift yang melewati tengah malam (Asumsi: Pola shift sirkular / sama tiap hari)
+                elif shift_start_dt - pd.Timedelta(days=1) <= dt < shift_end_dt - pd.Timedelta(days=1):
+                    active_shifts_in_interval.append(shift_vars[s_code])
+            
+            # Constraint: Total agent aktif >= Kebutuhan saat itu
+            prob += pulp.lpSum(active_shifts_in_interval) >= req, f"Req_{dt.strftime('%H%M')}"
+            
+        # 5. Selesaikan Model
+        prob.solve(pulp.PULP_CBC_CMD(msg=0))
+        
+        # 6. Ekstrak Hasil Solusi
         row_res = {'Tanggal': d}
         total = 0
-        for s_code, _ in shift_items:
-            val = day_shifts[s_code]
+        for s_code in shift_items.keys():
+            val = int(shift_vars[s_code].varValue) if shift_vars[s_code].varValue else 0
             row_res[s_code] = val
             total += val
         row_res['Total_Agent_Shift'] = total
@@ -79,31 +87,31 @@ def optimize_shift_distribution(df_result, master_shifts):
         
     return pd.DataFrame(results)
 
-# --- FUNGSI ERLANG C ITERATIF ---
-@st.cache_data(show_spinner=False)
-def erlang_c_prob(agents, traffic):
-    if agents <= traffic:
+# --- FUNGSI ERLANG C ITERATIF (DENGAN LRU CACHE MURNI UNTUK PERFORMA) ---
+@lru_cache(maxsize=100000)
+def erlang_c_prob(agents, traffic_rounded):
+    if agents <= traffic_rounded:
         return 1.0
     erlang_b_inv = 1.0
     for i in range(1, int(agents) + 1):
-        erlang_b_inv = 1.0 + erlang_b_inv * i / traffic
+        erlang_b_inv = 1.0 + erlang_b_inv * i / traffic_rounded
     erlang_b = 1.0 / erlang_b_inv
-    erlang_c = erlang_b / (1.0 - (traffic / agents) * (1.0 - erlang_b))
+    erlang_c = erlang_b / (1.0 - (traffic_rounded / agents) * (1.0 - erlang_b))
     return max(0.0, min(1.0, erlang_c))
 
-@st.cache_data(show_spinner=False)
-def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time):
+def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time, interval_seconds=1800):
     if pd.isna(cof) or pd.isna(aht_seconds) or cof <= 0:
         return 0, 0.0, 1.0
     
-    interval_seconds = 1800 
     traffic = (cof * aht_seconds) / interval_seconds
+    traffic_rounded = round(traffic, 2) # Dibulatkan agar Cache Hit Rate Maksimal
+    
     agents = math.ceil(traffic)
     if agents == 0:
         agents = 1
     
     while True:
-        prob_wait = erlang_c_prob(agents, traffic)
+        prob_wait = erlang_c_prob(agents, traffic_rounded)
         if agents > traffic:
             asa = prob_wait * (aht_seconds / (agents - traffic))
             sl = 1 - (prob_wait * math.exp(-(agents - traffic) * max_wait_time / aht_seconds))
@@ -280,12 +288,13 @@ file_aht = st.sidebar.file_uploader("Upload Data AHT (Interval 30 Min)", type=['
 file_shift = st.sidebar.file_uploader("Upload Master Shift (Opsional)", type=['csv', 'xlsx'], help="Jika dikosongkan, sistem menggunakan Shift 24 Jam Default.")
 file_holidays = st.sidebar.file_uploader("Upload Data Libur Nasional (Opsional)", type=['csv', 'xlsx'])
 
-st.sidebar.header("⚙️ 2. Konfigurasi Erlang C")
+st.sidebar.header("⚙️ 2. Konfigurasi WFM & Erlang C")
 target_sl = st.sidebar.slider("Target Service Level (%)", min_value=50, max_value=100, value=90) / 100
 max_wait_time = st.sidebar.number_input("Target ASA / Max Wait Time (Detik)", value=20)
 shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
 work_hours = st.sidebar.number_input("Jam Kerja per Hari (Untuk FTE)", value=8)
 work_days = st.sidebar.number_input("Hari Kerja/Agen/Bulan", value=22)
+shift_duration = st.sidebar.number_input("Durasi 1 Shift (Jam)", value=9)
 
 st.sidebar.header("📊 3. Profil Intraday Interval")
 months_profile = st.sidebar.slider("Gunakan Profil Interval (Bulan Terakhir)", min_value=1, max_value=12, value=3, help="Rentang waktu historis untuk mengambil pola jam sibuk intraday.")
@@ -315,7 +324,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             except Exception as e:
                 st.warning(f"Gagal membaca file Shift. Error: {e}")
                 
-        with st.spinner("Memvalidasi dan Membaca Data Historis..."):
+        with st.spinner("Memvalidasi, Membaca, & Pre-processing Data Historis..."):
             df_cof = pd.read_csv(file_cof) if file_cof.name.endswith('csv') else pd.read_excel(file_cof)
             df_aht = pd.read_csv(file_aht) if file_aht.name.endswith('csv') else pd.read_excel(file_aht)
             
@@ -336,6 +345,10 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof = df_cof[(df_cof['Datetime'] >= pd.to_datetime(start_hist)) & (df_cof['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             df_aht = df_aht[(df_aht['Datetime'] >= pd.to_datetime(start_hist)) & (df_aht['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             
+            # --- IMPROVEMENT: PRE-PROCESSING RESAMPLING (Mencegah Missing Interval) ---
+            df_cof = df_cof.set_index('Datetime').resample('30T').asfreq().fillna(0).reset_index()
+            df_aht = df_aht.set_index('Datetime').resample('30T').asfreq().fillna(0).reset_index()
+
         with st.spinner(f"Melatih Model AI & Menerapkan Intraday Profiling ({months_profile} Bulan Terakhir)..."):
             df_cof['COF_cleansed'], _ = cleanse_data_hw(df_cof, 'COF', min_residual=15)
             df_aht['AHT_cleansed'], _ = cleanse_data_hw(df_aht, 'AHT', min_residual=50)
@@ -392,7 +405,8 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_result = pd.merge(forecast_cof_final, forecast_aht_final, on='Datetime')
             df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
-        with st.spinner("Kalkulasi Antrean Erlang C..."):
+        with st.spinner("Kalkulasi Antrean Erlang C (Fast Execution)..."):
+            # Karena erlang_c_prob sekarang menggunakan cache murni, iterasi ini akan sangat cepat
             df_result['Base_Agent_Needed'] = 0
             df_result['Projected_Wait_Time'] = 0.0
             df_result['Service_Level_Achieved'] = 0.0
@@ -437,8 +451,9 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL']]
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
-        with st.spinner("Menjalankan Alokasi Shift Stabil (Controlled Incremental Allocator)..."):
-            df_shift_dist = optimize_shift_distribution(df_result, active_shifts)
+        with st.spinner("Menjalankan Optimasi Shift LP (PuLP)..."):
+            # Menggunakan algoritma Linear Programming yang baru
+            df_shift_dist = optimize_shift_distribution_pulp(df_result, active_shifts, shift_duration)
 
         st.success("🎉 Seluruh Proses Selesai!")
         
@@ -479,8 +494,8 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             st.dataframe(tabel_interval, use_container_width=True)
             
         with tab5:
-            st.subheader("Matriks Optimal Kebutuhan Slot Shift")
-            st.markdown(f"Berikut adalah jumlah slot ideal untuk masing-masing shift dengan proteksi kestabilan shift malam dari profil {months_profile} bulan terakhir.")
+            st.subheader("Matriks Optimal Kebutuhan Slot Shift (PuLP Optimizer)")
+            st.markdown("Berikut adalah jumlah slot ideal untuk masing-masing shift, dihitung dengan pendekatan Linear Programming (Operations Research) untuk menghindari pemborosan agent pada satu shift tertentu.")
             
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
@@ -502,7 +517,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         st.download_button(
             label="📥 Download Laporan Lengkap (Excel)",
             data=output.getvalue(),
-            file_name=f"Forecast_WFM_{start_forecast}_to_{end_forecast}.xlsx",
+            file_name=f"Forecast_WFM_{start_forecast}_to_{end_forecast}_PuLP.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
