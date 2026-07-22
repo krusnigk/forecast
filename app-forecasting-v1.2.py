@@ -29,7 +29,7 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI ALOKASI SHIFT DENGAN LINEAR PROGRAMMING (PULP) ---
+# --- FUNGSI ALOKASI SHIFT DENGAN LINEAR PROGRAMMING (PULP) - REVISI MULTI-OBJECTIVE ---
 @st.cache_data(show_spinner=False)
 def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_hours=9):
     shift_items = {}
@@ -37,21 +37,26 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
         shift_items[s_code] = pd.to_timedelta(str(s_time))
         
     results = []
-    unique_dates = df_result['Date'].unique()
+    
+    # Pastikan format datetime aman
+    df_process = df_result.copy()
+    df_process['Datetime'] = pd.to_datetime(df_process['Datetime'])
+    df_process['Date'] = pd.to_datetime(df_process['Date']).dt.date
+    
+    unique_dates = df_process['Date'].unique()
     
     for d in unique_dates:
-        df_day = df_result[df_result['Date'] == d].sort_values('Datetime').copy()
+        df_day = df_process[df_process['Date'] == d].sort_values('Datetime').copy()
         
-        # 1. Inisialisasi Model LP untuk Hari Tersebut (Tujuan: Minimalisasi)
+        # 1. Inisialisasi Model LP
         prob = pulp.LpProblem(f"Shift_Allocation_{d}", pulp.LpMinimize)
         
-        # 2. Definisikan Variabel Keputusan (Jumlah agent di tiap shift, harus bilangan bulat >= 0)
+        # 2. Variabel Keputusan (Jumlah agent di tiap shift)
         shift_vars = {s_code: pulp.LpVariable(f"{s_code}", lowBound=0, cat='Integer') for s_code in shift_items.keys()}
         
-        # 3. Fungsi Objektif: Minimalkan Total Agent Harian
-        prob += pulp.lpSum([shift_vars[s_code] for s_code in shift_items.keys()])
+        # Variabel penampung surplus di setiap interval
+        surplus_vars = []
         
-        # 4. Constraints (Batasan): Kebutuhan Agent Tiap Interval Harus Terpenuhi
         for _, row in df_day.iterrows():
             dt = row['Datetime']
             req = row['Agent_Needed_Adjust']
@@ -59,29 +64,43 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
             active_shifts_in_interval = []
             
             for s_code, s_start_td in shift_items.items():
-                shift_start_dt = pd.to_datetime(d) + s_start_td
+                shift_start_dt = pd.to_datetime(str(d)) + s_start_td
                 shift_end_dt = shift_start_dt + pd.Timedelta(hours=shift_duration_hours)
                 
-                # Cek jika shift aktif di interval ini (Tumpang tindih antar shift otomatis ditangani)
+                # Cek shift aktif
                 if shift_start_dt <= dt < shift_end_dt:
                     active_shifts_in_interval.append(shift_vars[s_code])
-                # Menangani shift yang melewati tengah malam (Asumsi: Pola shift sirkular / sama tiap hari)
-                elif shift_start_dt - pd.Timedelta(days=1) <= dt < shift_end_dt - pd.Timedelta(days=1):
+                elif (shift_start_dt - pd.Timedelta(days=1)) <= dt < (shift_end_dt - pd.Timedelta(days=1)):
                     active_shifts_in_interval.append(shift_vars[s_code])
             
-            # Constraint: Total agent aktif >= Kebutuhan saat itu
-            prob += pulp.lpSum(active_shifts_in_interval) >= req, f"Req_{dt.strftime('%H%M')}"
+            interval_str = dt.strftime('%H%M')
             
-        # 5. Selesaikan Model
+            # Variabel Surplus
+            surplus = pulp.LpVariable(f"Surplus_{interval_str}", lowBound=0)
+            surplus_vars.append(surplus)
+            
+            # Constraint: Agen Duty - Surplus = Kebutuhan (Memaksa agar tercukupi sekaligus mengukur wastage)
+            prob += pulp.lpSum(active_shifts_in_interval) - surplus == req, f"Req_{interval_str}"
+            
+        # 3. Fungsi Objektif Baru (Total Agent + Penalti Wastage)
+        prob += pulp.lpSum([shift_vars[s_code] for s_code in shift_items.keys()]) + 0.01 * pulp.lpSum(surplus_vars)
+        
+        # 4. Selesaikan Model
         prob.solve(pulp.PULP_CBC_CMD(msg=0))
         
-        # 6. Ekstrak Hasil Solusi
+        # 5. Ekstrak Hasil Solusi
         row_res = {'Tanggal': d}
         total = 0
-        for s_code in shift_items.keys():
-            val = int(shift_vars[s_code].varValue) if shift_vars[s_code].varValue else 0
-            row_res[s_code] = val
-            total += val
+        
+        if pulp.LpStatus[prob.status] == 'Optimal':
+            for s_code in shift_items.keys():
+                val = int(shift_vars[s_code].varValue) if shift_vars[s_code].varValue is not None else 0
+                row_res[s_code] = val
+                total += val
+        else:
+            for s_code in shift_items.keys():
+                row_res[s_code] = 0
+                
         row_res['Total_Agent_Shift'] = total
         results.append(row_res)
         
@@ -345,7 +364,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_cof = df_cof[(df_cof['Datetime'] >= pd.to_datetime(start_hist)) & (df_cof['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             df_aht = df_aht[(df_aht['Datetime'] >= pd.to_datetime(start_hist)) & (df_aht['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))].copy()
             
-            # --- PERBAIKAN: PRE-PROCESSING RESAMPLING (Menggunakan standar frekuensi baru '30min') ---
+            # --- PRE-PROCESSING RESAMPLING ---
             df_cof = df_cof.set_index('Datetime').resample('30min').asfreq().fillna(0).reset_index()
             df_aht = df_aht.set_index('Datetime').resample('30min').asfreq().fillna(0).reset_index()
 
@@ -406,7 +425,6 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
         with st.spinner("Kalkulasi Antrean Erlang C (Fast Execution)..."):
-            # Karena erlang_c_prob sekarang menggunakan cache murni, iterasi ini akan sangat cepat
             df_result['Base_Agent_Needed'] = 0
             df_result['Projected_Wait_Time'] = 0.0
             df_result['Service_Level_Achieved'] = 0.0
@@ -452,7 +470,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
 
         with st.spinner("Menjalankan Optimasi Shift LP (PuLP)..."):
-            # Menggunakan algoritma Linear Programming yang baru
+            # Menggunakan algoritma Linear Programming yang baru (Fungsi Objektif Ganda)
             df_shift_dist = optimize_shift_distribution_pulp(df_result, active_shifts, shift_duration)
 
         st.success("🎉 Seluruh Proses Selesai!")
@@ -495,7 +513,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             
         with tab5:
             st.subheader("Matriks Optimal Kebutuhan Slot Shift (PuLP Optimizer)")
-            st.markdown("Berikut adalah jumlah slot ideal untuk masing-masing shift, dihitung dengan pendekatan Linear Programming (Operations Research) untuk menghindari pemborosan agent pada satu shift tertentu.")
+            st.markdown("Berikut adalah jumlah slot ideal untuk masing-masing shift, dihitung dengan pendekatan Linear Programming (Operations Research) dengan objektif ganda untuk menekan pemborosan agent pada jam sepi.")
             
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
