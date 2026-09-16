@@ -31,7 +31,7 @@ DEFAULT_SHIFTS = {
 
 # --- FUNGSI ALOKASI SHIFT (PULP) - STRICT CONSTRAINT ---
 @st.cache_data(show_spinner=False)
-def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_hours=9, target_mode='Base'):
+def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_hours=9.0, target_mode='Base'):
     shift_items = {}
     for s_code, s_time in master_shifts.items():
         shift_items[s_code] = pd.to_timedelta(str(s_time))
@@ -217,11 +217,13 @@ opt_target = st.sidebar.radio(
 st.sidebar.header("⚙️ 3. Konfigurasi WFM")
 target_sl = st.sidebar.slider("Target Service Level (%)", min_value=50, max_value=100, value=90) / 100
 max_wait_time = st.sidebar.number_input("Target ASA (Detik)", value=20)
-max_occupancy = st.sidebar.slider("Target Max Occupancy (%)", min_value=50, max_value=100, value=85, help="Batas maksimal kesibukan agen. Mengurangi risiko burnout di jam sibuk.") / 100
+max_occupancy = st.sidebar.slider("Target Max Occupancy (%)", min_value=50, max_value=100, value=85, help="Batas maksimal kesibukan agen.") / 100
 shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
-work_hours = st.sidebar.number_input("Jam Kerja per Hari (FTE)", value=8)
+
+# PERBAIKAN: Ubah menjadi desimal dengan step 0.5 untuk mengakomodir 30 menit
+work_hours = st.sidebar.number_input("Jam Kerja per Hari (FTE)", min_value=1.0, max_value=24.0, value=8.0, step=0.5, format="%.1f", help="Gunakan angka desimal. 7.5 = 7 jam 30 menit.")
 work_days = st.sidebar.number_input("Hari Kerja/Agen/Bulan", value=22)
-shift_duration = st.sidebar.number_input("Durasi 1 Shift (Jam)", value=9)
+shift_duration = st.sidebar.number_input("Durasi 1 Shift (Jam)", min_value=1.0, max_value=24.0, value=9.0, step=0.5, format="%.1f", help="Gunakan angka desimal. 8.5 = 8 jam 30 menit.")
 
 st.sidebar.header("📊 4. Profil Intraday")
 months_profile = st.sidebar.slider("Gunakan Profil Interval (Bulan Terakhir)", min_value=1, max_value=12, value=3)
@@ -258,7 +260,6 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce', dayfirst=True)
                 df = df.dropna(subset=['Datetime']) 
                 
-                # Membulatkan waktu ke 30 menit terdekat
                 df['Datetime'] = df['Datetime'].dt.round('30min')
                 
                 mask = (df['Datetime'] >= pd.to_datetime(start_hist)) & (df['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))
