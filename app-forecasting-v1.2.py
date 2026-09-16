@@ -50,7 +50,6 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
         
         prob = pulp.LpProblem(f"Shift_Allocation_{d}", pulp.LpMinimize)
         
-        # Variabel Keputusan
         shift_vars = {s_code: pulp.LpVariable(f"{s_code}", lowBound=0, cat='Integer') for s_code in shift_items.keys()}
         surplus_vars = []
         
@@ -150,10 +149,9 @@ def cleanse_data_hw(df, target_col, seasonal_periods=7, threshold=2.0, min_resid
     cleansed_series[is_anomaly] = fitted_values[is_anomaly]
     return cleansed_series, is_anomaly
 
-# --- FUNGSI PROPHET UNTUK HARIAN (Digunakan untuk COF & AHT) ---
+# --- FUNGSI PROPHET UNTUK HARIAN ---
 @st.cache_data(show_spinner=False)
 def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fcst, use_auto_payday=True):
-    # PERBAIKAN: Membungkus ds dengan pd.to_datetime() agar seragam formatnya
     df_prophet = pd.DataFrame({'ds': pd.to_datetime(df_hist_daily['Date']), 'y': df_hist_daily[target_col]})
     
     holidays_list = []
@@ -259,8 +257,15 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce', dayfirst=True)
                 df = df.dropna(subset=['Datetime']) 
                 
+                # Membulatkan waktu ke 30 menit terdekat untuk menghilangkan milidetik korup
+                df['Datetime'] = df['Datetime'].dt.round('30min')
+                
                 mask = (df['Datetime'] >= pd.to_datetime(start_hist)) & (df['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))
                 df = df[mask].copy()
+                
+                # Menggabungkan duplikasi akibat pembulatan
+                df = df.groupby('Datetime')[col_target].first().reset_index()
+                
                 return df.set_index('Datetime').resample('30min').asfreq().fillna(0).reset_index()
 
             df_cof = robust_wfm_parser(file_cof, 'COF')
@@ -273,13 +278,11 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         with st.spinner("Melatih Model AI & Menerapkan Intraday Profiling..."):
             df_cof_daily_raw = df_cof.groupby(df_cof['Datetime'].dt.date)['COF'].sum().reset_index()
             df_cof_daily_raw.columns = ['Date', 'COF']
-            # PERBAIKAN: Paksa konversi kembali ke Timestamp Pandas untuk COF
             df_cof_daily_raw['Date'] = pd.to_datetime(df_cof_daily_raw['Date'])
             df_cof_daily_raw['COF_cleansed'], _ = cleanse_data_hw(df_cof_daily_raw, 'COF', seasonal_periods=7, min_residual=15)
             
             df_aht_daily_raw = df_aht.replace(0, np.nan).groupby(df_aht['Datetime'].dt.date)['AHT'].mean().reset_index()
             df_aht_daily_raw.columns = ['Date', 'AHT']
-            # PERBAIKAN: Paksa konversi kembali ke Timestamp Pandas untuk AHT
             df_aht_daily_raw['Date'] = pd.to_datetime(df_aht_daily_raw['Date'])
             df_aht_daily_raw['AHT'] = df_aht_daily_raw['AHT'].ffill()
             df_aht_daily_raw['AHT_cleansed'], _ = cleanse_data_hw(df_aht_daily_raw, 'AHT', seasonal_periods=7, min_residual=10)
