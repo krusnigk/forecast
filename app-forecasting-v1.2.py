@@ -139,7 +139,6 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time, interval
 # --- FUNGSI CLEANSING HOLT-WINTERS ---
 @st.cache_data(show_spinner=False)
 def cleanse_data_hw(df, target_col, seasonal_periods=7, threshold=2.0, min_residual=15):
-    # Diubah seasonal_periods default ke 7 (karena sekarang data level harian)
     series = df[target_col].ffill().bfill()
     model = ExponentialSmoothing(series, trend='add', seasonal='add', seasonal_periods=seasonal_periods, initialization_method="estimated")
     hw_fit = model.fit()
@@ -154,7 +153,8 @@ def cleanse_data_hw(df, target_col, seasonal_periods=7, threshold=2.0, min_resid
 # --- FUNGSI PROPHET UNTUK HARIAN (Digunakan untuk COF & AHT) ---
 @st.cache_data(show_spinner=False)
 def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fcst, use_auto_payday=True):
-    df_prophet = pd.DataFrame({'ds': df_hist_daily['Date'], 'y': df_hist_daily[target_col]})
+    # PERBAIKAN: Membungkus ds dengan pd.to_datetime() agar seragam formatnya
+    df_prophet = pd.DataFrame({'ds': pd.to_datetime(df_hist_daily['Date']), 'y': df_hist_daily[target_col]})
     
     holidays_list = []
     holiday_dates = []
@@ -181,7 +181,6 @@ def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fc
         
     final_holidays = pd.concat(holidays_list, ignore_index=True) if holidays_list else None
         
-    # Error Handling Global jika matriks data terlalu datar (kurang varians)
     try:
         model = Prophet(holidays=final_holidays, daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True, seasonality_mode='multiplicative')
         model.fit(df_prophet)
@@ -197,7 +196,6 @@ def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fc
         future_forecast = forecast[(forecast['ds'] >= start_fcst_dt) & (forecast['ds'] <= end_fcst_dt)][['ds', 'yhat']]
         future_forecast.rename(columns={'ds': 'Date', 'yhat': f'{target_col}_daily_forecast'}, inplace=True)
         
-        # AHT tidak boleh 0 atau negatif, set min 1
         future_forecast[f'{target_col}_daily_forecast'] = future_forecast[f'{target_col}_daily_forecast'].clip(lower=1)
         return future_forecast
     except Exception as e:
@@ -253,16 +251,13 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 st.warning(f"Gagal membaca file Shift. Error: {e}")
                 
         with st.spinner("Memvalidasi, Membaca, & Pre-processing Data Historis..."):
-            # 1. ROBUST PARSER: Mencegah error format lintas perangkat
             def robust_wfm_parser(uploaded_file, col_target):
                 df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('csv') else pd.read_excel(uploaded_file)
-                # Menangani locale koma menjadi titik desimal
                 if df[col_target].dtype == 'object':
                     df[col_target] = df[col_target].astype(str).str.replace(',', '.').astype(float)
                 
-                # Memaksa konversi tanggal yang aman
                 df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce', dayfirst=True)
-                df = df.dropna(subset=['Datetime']) # Buang baris korup
+                df = df.dropna(subset=['Datetime']) 
                 
                 mask = (df['Datetime'] >= pd.to_datetime(start_hist)) & (df['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))
                 df = df[mask].copy()
@@ -276,21 +271,22 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 df_holidays = pd.read_csv(file_holidays) if file_holidays.name.endswith('csv') else pd.read_excel(file_holidays)
 
         with st.spinner("Melatih Model AI & Menerapkan Intraday Profiling..."):
-            # 2. OPTIMASI: Cleansing HW dilakukan di level HARIAN (Sangat Cepat)
             df_cof_daily_raw = df_cof.groupby(df_cof['Datetime'].dt.date)['COF'].sum().reset_index()
             df_cof_daily_raw.columns = ['Date', 'COF']
+            # PERBAIKAN: Paksa konversi kembali ke Timestamp Pandas untuk COF
+            df_cof_daily_raw['Date'] = pd.to_datetime(df_cof_daily_raw['Date'])
             df_cof_daily_raw['COF_cleansed'], _ = cleanse_data_hw(df_cof_daily_raw, 'COF', seasonal_periods=7, min_residual=15)
             
             df_aht_daily_raw = df_aht.replace(0, np.nan).groupby(df_aht['Datetime'].dt.date)['AHT'].mean().reset_index()
             df_aht_daily_raw.columns = ['Date', 'AHT']
+            # PERBAIKAN: Paksa konversi kembali ke Timestamp Pandas untuk AHT
+            df_aht_daily_raw['Date'] = pd.to_datetime(df_aht_daily_raw['Date'])
             df_aht_daily_raw['AHT'] = df_aht_daily_raw['AHT'].ffill()
             df_aht_daily_raw['AHT_cleansed'], _ = cleanse_data_hw(df_aht_daily_raw, 'AHT', seasonal_periods=7, min_residual=10)
 
-            # 3. FORECAST HARIAN
             forecast_cof_daily = run_prophet_daily(df_cof_daily_raw, df_holidays, 'COF_cleansed', start_forecast, end_forecast, use_auto_payday=use_payday)
             forecast_aht_daily = run_prophet_daily(df_aht_daily_raw, df_holidays, 'AHT_cleansed', start_forecast, end_forecast, use_auto_payday=use_payday)
 
-            # 4. INTRADAY PROFILING (COF & AHT Dihitung Bersamaan)
             max_hist_date = df_cof['Datetime'].max()
             profile_start_date = max_hist_date - pd.DateOffset(months=months_profile)
             
@@ -303,27 +299,22 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_recent['Is_Weekend'] = df_recent['Datetime'].dt.weekday >= 5
             df_recent['Date_Only'] = df_recent['Datetime'].dt.date
 
-            # Kalkulasi Profil COF
             daily_totals = df_recent.groupby(['Date_Only', 'Is_Weekend'])['COF'].sum().reset_index(name='Daily_Total_COF')
             df_recent = pd.merge(df_recent, daily_totals, on=['Date_Only', 'Is_Weekend'])
             df_recent['COF_Ratio'] = np.where(df_recent['Daily_Total_COF'] > 0, df_recent['COF'] / df_recent['Daily_Total_COF'], 0)
             
-            # Kalkulasi Profil AHT
             daily_aht_mean = df_recent.replace({'AHT': 0}, np.nan).groupby(['Date_Only', 'Is_Weekend'])['AHT'].mean().reset_index(name='Daily_Mean_AHT')
             df_recent = pd.merge(df_recent, daily_aht_mean, on=['Date_Only', 'Is_Weekend'])
             df_recent['AHT_Ratio'] = np.where(df_recent['Daily_Mean_AHT'] > 0, df_recent['AHT'] / df_recent['Daily_Mean_AHT'], 1)
 
-            # Agregasi ke Profil Master
             profile = df_recent.groupby(['Is_Weekend', 'Time']).agg(
                 COF_Ratio=('COF_Ratio', 'mean'),
                 AHT_Ratio=('AHT_Ratio', 'mean')
             ).reset_index()
             
-            # Normalisasi Rasio
             sum_ratios_cof = profile.groupby('Is_Weekend')['COF_Ratio'].transform('sum')
             profile['COF_Ratio'] = profile['COF_Ratio'] / sum_ratios_cof
 
-            # Rekonstruksi Forecast Interval
             forecast_dates = pd.date_range(start=start_forecast, end=end_forecast)
             reconstructed_rows = []
             
@@ -353,7 +344,6 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
         with st.spinner("Kalkulasi Antrean Erlang C (Vectorized)..."):
-            # 5. VECTORIZATION: Mengganti iterrows untuk kecepatan maksimum
             erlang_results = [
                 calculate_agents_erlang(cof, aht, target_sl, max_wait_time) 
                 for cof, aht in zip(df_result['COF_forecast'], df_result['AHT_forecast'])
@@ -366,7 +356,6 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
             df_result['Date'] = df_result['Datetime'].dt.date
             
-            # Kalkulasi Dashboard Bulanan & Harian
             total_monthly_headcount = math.ceil(((df_result.groupby('Date')['Agent_Needed_Adjust'].sum() * 0.5) / work_hours).mean() * ((pd.to_datetime(end_forecast) - pd.to_datetime(start_forecast)).days + 1) / work_days)
             df_daily_workload_hours = df_result.groupby('Date')['Agent_Needed_Adjust'].sum() * 0.5
             daily_headcount_needed = np.ceil(df_daily_workload_hours / work_hours)
