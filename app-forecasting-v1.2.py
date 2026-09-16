@@ -217,6 +217,7 @@ opt_target = st.sidebar.radio(
 st.sidebar.header("⚙️ 3. Konfigurasi WFM")
 target_sl = st.sidebar.slider("Target Service Level (%)", min_value=50, max_value=100, value=90) / 100
 max_wait_time = st.sidebar.number_input("Target ASA (Detik)", value=20)
+max_occupancy = st.sidebar.slider("Target Max Occupancy (%)", min_value=50, max_value=100, value=85, help="Batas maksimal kesibukan agen. Mengurangi risiko burnout di jam sibuk.") / 100
 shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
 work_hours = st.sidebar.number_input("Jam Kerja per Hari (FTE)", value=8)
 work_days = st.sidebar.number_input("Hari Kerja/Agen/Bulan", value=22)
@@ -257,15 +258,13 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce', dayfirst=True)
                 df = df.dropna(subset=['Datetime']) 
                 
-                # Membulatkan waktu ke 30 menit terdekat untuk menghilangkan milidetik korup
+                # Membulatkan waktu ke 30 menit terdekat
                 df['Datetime'] = df['Datetime'].dt.round('30min')
                 
                 mask = (df['Datetime'] >= pd.to_datetime(start_hist)) & (df['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))
                 df = df[mask].copy()
                 
-                # Menggabungkan duplikasi akibat pembulatan
                 df = df.groupby('Datetime')[col_target].first().reset_index()
-                
                 return df.set_index('Datetime').resample('30min').asfreq().fillna(0).reset_index()
 
             df_cof = robust_wfm_parser(file_cof, 'COF')
@@ -346,15 +345,21 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_result = pd.DataFrame(reconstructed_rows)
             df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
-        with st.spinner("Kalkulasi Antrean Erlang C (Vectorized)..."):
+        with st.spinner("Kalkulasi Antrean Erlang C (Include Occupancy Target)..."):
             erlang_results = [
                 calculate_agents_erlang(cof, aht, target_sl, max_wait_time) 
                 for cof, aht in zip(df_result['COF_forecast'], df_result['AHT_forecast'])
             ]
             
-            df_result['Base_Agent_Needed'] = [res[0] for res in erlang_results]
+            df_result['Agent_for_SL'] = [res[0] for res in erlang_results]
             df_result['Projected_Wait_Time'] = [res[1] for res in erlang_results]
             df_result['Service_Level_Achieved'] = [res[2] for res in erlang_results]
+            
+            df_result['Traffic_Erlangs'] = (df_result['COF_forecast'] * df_result['AHT_forecast']) / 1800
+            df_result['Agent_for_Occupancy'] = np.ceil(df_result['Traffic_Erlangs'] / max_occupancy)
+            
+            df_result['Base_Agent_Needed'] = np.maximum(df_result['Agent_for_SL'], df_result['Agent_for_Occupancy'])
+            df_result['Projected_Occupancy'] = np.where(df_result['Base_Agent_Needed'] > 0, df_result['Traffic_Erlangs'] / df_result['Base_Agent_Needed'], 0)
             
             df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
             df_result['Date'] = df_result['Datetime'].dt.date
@@ -367,7 +372,8 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 Total_COF=('COF_forecast', 'sum'),
                 Rata_Rata_AHT=('AHT_forecast', 'mean'),
                 Max_Kebutuhan_Agent=('Agent_Needed_Adjust', 'max'),
-                Rata_Rata_SL=('Service_Level_Achieved', 'mean')
+                Rata_Rata_SL=('Service_Level_Achieved', 'mean'),
+                Rata_Rata_Occ=('Projected_Occupancy', 'mean')
             ).reset_index()
 
             df_daily['Headcount_Harian_FTE'] = df_daily['Date'].map(daily_headcount_needed)
@@ -378,9 +384,10 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             df_daily_display['Headcount_Harian_FTE'] = df_daily_display['Headcount_Harian_FTE'].astype(int) 
             df_daily_display['Max_Kebutuhan_Agent'] = df_daily_display['Max_Kebutuhan_Agent'].astype(int)
             df_daily_display['Rata_Rata_SL'] = df_daily_display['Rata_Rata_SL'].apply(lambda x: f"{x:.2%}")
+            df_daily_display['Rata_Rata_Occ'] = df_daily_display['Rata_Rata_Occ'].apply(lambda x: f"{x:.2%}")
             
-            df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL']]
-            df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL']
+            df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL', 'Rata_Rata_Occ']]
+            df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL', 'Proyeksi Occupancy']
 
         with st.spinner(f"Menjalankan Optimasi Shift LP (Target: {opt_target})..."):
             mode = 'Base' if 'Base' in opt_target else 'Adjusted'
@@ -399,7 +406,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         with tab3:
             st.dataframe(df_daily_display, use_container_width=True)
         with tab4:
-            st.dataframe(df_result[['Datetime', 'Base_Agent_Needed', 'Agent_Needed_Adjust']], use_container_width=True)
+            st.dataframe(df_result[['Datetime', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Projected_Occupancy']], use_container_width=True)
         with tab5:
             st.markdown(f"**Target Optimasi Terpilih: {opt_target}**")
             st.markdown("Algoritma kini diatur dengan **Hard Constraint**: Jumlah agen tidak akan pernah di bawah batas target yang Anda pilih, sehingga Service Level di setiap interval akan terjamin.")
@@ -414,14 +421,14 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             df_daily_display.to_excel(writer, sheet_name='Hasil_Harian', index=False)
-            df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Service_Level_Achieved', 'Projected_Wait_Time']].to_excel(writer, sheet_name='Detail_Interval', index=False)
+            df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Service_Level_Achieved', 'Projected_Wait_Time', 'Projected_Occupancy']].to_excel(writer, sheet_name='Detail_Interval', index=False)
             if not df_shift_dist.empty:
                 df_shift_dist.to_excel(writer, sheet_name='Distribusi_Shift', index=False)
         
         st.download_button(
             label="📥 Download Laporan Lengkap (Excel)",
             data=output.getvalue(),
-            file_name=f"Forecast_WFM_{start_forecast}_to_{end_forecast}_PuLP.xlsx",
+            file_name=f"Forecast_WFM_Include_Occ_{start_forecast}_to_{end_forecast}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
