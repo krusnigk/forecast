@@ -8,3 +8,4 @@ xlsxwriter
 statsmodels
 scikit-learn
 pulp
+google-generativeai
