@@ -247,7 +247,6 @@ if menu == "📊 Forecast & Planner":
                 fcst_cof = run_prophet_daily(df_cof_daily, None, 'COF_cleansed', start_forecast, end_forecast, True)
                 fcst_aht = run_prophet_daily(df_aht_daily, None, 'AHT_cleansed', start_forecast, end_forecast, True)
 
-                # Simplified profiling for brevity in code snippet
                 profile_start = df_cof['Datetime'].max() - pd.DateOffset(months=3)
                 df_recent = pd.merge(df_cof[df_cof['Datetime'] >= profile_start], df_aht[df_aht['Datetime'] >= profile_start], on='Datetime')
                 df_recent['Time'] = df_recent['Datetime'].dt.time
@@ -335,7 +334,6 @@ elif menu == "🤖 Auto Rostering":
     agent_df = st.session_state.get('agent_data', pd.DataFrame())
     comp_df = st.session_state.get('shift_target', pd.DataFrame())
 
-    # Validasi apakah data di Halaman 2 sudah diisi
     if agent_df.empty or comp_df.empty:
         st.warning("⚠️ Data Agent atau Target Komposisi belum lengkap. Silakan lengkapi di Halaman 'Database Agent & Target' terlebih dahulu.")
     else:
@@ -344,65 +342,58 @@ elif menu == "🤖 Auto Rostering":
         if st.button("🚀 Jalankan Auto Roster", type="primary", use_container_width=True):
             with st.spinner("Mengacak dan mendistribusikan shift secara adil..."):
                 try:
-                    # Ambil daftar nama agen (asumsi berada di kolom pertama atau kolom bernama 'Nama')
                     name_col = next((c for c in agent_df.columns if 'nama' in c.lower()), agent_df.columns[0])
                     master_agents = agent_df[name_col].dropna().astype(str).tolist()
-                    
                     roster_records = []
                     
-                    # Looping setiap hari di dalam data komposisi shift
                     for _, row in comp_df.iterrows():
                         date_val = row.get('Tanggal', 'Unknown Date')
                         
-                        # Ambil kebutuhan shift hari ini (abaikan kolom Tanggal & Total)
+                        # --- BLOK KODE YANG DIPERBAIKI (BUG FIX: SAFE PARSING) ---
                         shift_reqs = {}
                         for col in comp_df.columns:
-                            if col not in ['Tanggal', 'Total_Agent_Shift'] and pd.notna(row[col]):
-                                count = int(row[col])
-                                if count > 0:
-                                    shift_reqs[col] = count
+                            if col.strip().lower() not in ['tanggal', 'total_agent_shift', 'date'] and pd.notna(row[col]):
+                                try:
+                                    # Konversi ke float dulu untuk antisipasi nilai desimal, lalu ke integer
+                                    count = int(float(row[col]))
+                                    if count > 0:
+                                        shift_reqs[col] = count
+                                except ValueError:
+                                    # Jika kolom mengandung string murni (misal judul shift 'S1'), maka diabaikan
+                                    continue
+                        # --------------------------------------------------------
                         
-                        # 1. Acak daftar agen agar pembagian shift adil (tidak itu-itu saja yang shift pagi)
                         np.random.shuffle(master_agents)
-                        
                         daily_assignment = {'Nama Agen': master_agents.copy()}
                         assigned_dict = {}
                         agent_idx = 0
                         
-                        # 2. Assign shift berdasarkan kuota
                         for shift_code, count in shift_reqs.items():
                             for _ in range(count):
                                 if agent_idx < len(master_agents):
                                     assigned_dict[master_agents[agent_idx]] = shift_code
                                     agent_idx += 1
                                     
-                        # 3. Sisanya yang tidak dapat kuota shift akan di-set menjadi OFF
                         for ag in master_agents:
                             if ag not in assigned_dict:
                                 assigned_dict[ag] = 'OFF'
                                 
-                        # Simpan jadwal per hari ini
                         roster_records.append({'Tanggal': date_val, 'Assignments': assigned_dict})
 
-                    # Membangun DataFrame Akhir (Baris = Agen, Kolom = Tanggal)
                     final_roster = pd.DataFrame({'Nama Agen': master_agents})
                     for record in roster_records:
                         date_col = record['Tanggal']
                         final_roster[date_col] = final_roster['Nama Agen'].map(record['Assignments'])
                     
                     final_roster = final_roster.set_index('Nama Agen')
-                    
-                    # Simpan hasil ke session_state agar tidak hilang jika tombol tidak sengaja tertekan ulang
                     st.session_state['final_roster'] = final_roster
                     
                 except Exception as e:
                     st.error(f"Gagal menjalankan Auto-Roster: {e}")
 
-        # Jika jadwal sudah berhasil di-generate, tampilkan dengan Visual Color Coding
         if 'final_roster' in st.session_state:
             df_roster = st.session_state['final_roster']
             
-            # Fungsi pewarnaan agar mirip dengan Schedule Viewer Halaman 2
             def style_auto_roster(val):
                 if pd.isna(val) or str(val).strip() == '': return ''
                 val_str = str(val).strip().upper()
@@ -413,7 +404,6 @@ elif menu == "🤖 Auto Rostering":
             st.subheader("📋 Hasil Jadwal Roster Otomatis")
             st.dataframe(df_roster.style.map(style_auto_roster), use_container_width=True, height=500)
             
-            # Tombol Export
             out_excel = io.BytesIO()
             with pd.ExcelWriter(out_excel, engine='xlsxwriter') as writer:
                 df_roster.to_excel(writer, sheet_name="Roster_Jadwal")
