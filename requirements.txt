@@ -1,11 +1,9 @@
 streamlit
 pandas
-prophet
-matplotlib
 numpy
+prophet
+statsmodels
+pulp
+google-generativeai>=0.7.0
 openpyxl
 xlsxwriter
-statsmodels
-scikit-learn
-pulp
-google-generativeai
