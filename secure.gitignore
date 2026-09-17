@@ -1,0 +1,16 @@
+# Mengabaikan file data (Keamanan Data WFM)
+*.csv
+*.xlsx
+*.xls
+
+# Mengabaikan cache Python
+__pycache__/
+*.pyc
+
+# Mengabaikan environment (jika Anda pakai virtual env lokal)
+venv/
+env/
+.env
+
+# Mengabaikan konfigurasi rahasia Streamlit lokal
+.streamlit/secrets.toml
