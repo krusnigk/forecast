@@ -432,7 +432,9 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 try:
                     # 1. Konfigurasi Kunci API
                     genai.configure(api_key=api_key_input)
-                    model = genai.GenerativeModel('gemini-1.5-pro')
+                    # Menggunakan model Flash (Sangat cepat & stabil untuk analitik teks)
+                    model = genai.GenerativeModel('gemini-1.5-flash') 
+
                     
                     # 2. Rangkum metrik kunci agar AI paham konteksnya
                     total_vol_sebulan = df_daily_display['Total COF'].sum()
