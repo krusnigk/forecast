@@ -423,42 +423,33 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 st.bar_chart(df_chart)
 
         # ==========================================
-        # INTEGRASI GEMINI AI - EXECUTIVE SUMMARY
+        # INTEGRASI GEMINI AI - MODE DIAGNOSTIK
         # ==========================================
         if api_key_input:
             st.markdown("---")
-            st.subheader("✨ AI Executive Summary")
-            with st.spinner("Mengirim data ke Gemini AI untuk dianalisis..."):
+            st.subheader("🛠️ Diagnostik API Key")
+            with st.spinner("Menghubungi server Google..."):
                 try:
-                    # 1. Konfigurasi Kunci API
+                    import google.generativeai as genai
                     genai.configure(api_key=api_key_input)
-                    # Menggunakan model Flash (Sangat cepat & stabil untuk analitik teks)
-                    model = genai.GenerativeModel('gemini-pro')
-
                     
-                    # 2. Rangkum metrik kunci agar AI paham konteksnya
-                    total_vol_sebulan = df_daily_display['Total COF'].sum()
-                    peak_agent = df_daily_display['Kebutuhan Agent (Max/Peak)'].max()
-                    avg_occ = df_result['Projected_Occupancy'].mean() * 100
+                    # Meminta server Google menampilkan semua model yang tersedia
+                    available_models = []
+                    for m in genai.list_models():
+                        if 'generateContent' in m.supported_generation_methods:
+                            available_models.append(m.name)
                     
-                    # 3. Merakit Prompt (Instruksi untuk AI)
-                    prompt = f"""
-                    Anda adalah Konsultan WFM Senior. Saya baru saja selesai melakukan forecasting.
-                    Berikut adalah ringkasan metrik hasil forecasting:
-                    - Total Interaksi/Volume: {total_vol_sebulan}
-                    - Kebutuhan Agen Tertinggi dalam satu hari: {peak_agent} agen
-                    - Rata-rata Proyeksi Occupancy: {avg_occ:.2f}%
-                    
-                    Berikan ringkasan eksekutif (maksimal 3 paragraf) yang profesional. 
-                    Berikan insight singkat apakah rata-rata occupancy {avg_occ:.2f}% ini sehat untuk agen (terhindar dari burnout), dan berikan saran strategis untuk penjadwalan.
-                    """
-                    
-                    # 4. Eksekusi dan Tampilkan Hasil
-                    response = model.generate_content(prompt)
-                    st.info(response.text)
-                    
+                    if available_models:
+                        st.success("✅ API Key Valid! Berikut adalah model yang diizinkan untuk Anda:")
+                        for model_name in available_models:
+                            st.code(model_name)
+                            
+                        st.info("Beritahu saya salah satu nama model di atas agar kita bisa selesaikan aplikasinya!")
+                    else:
+                        st.warning("⚠️ API Key valid, tetapi tidak ada model yang tersedia untuk akun ini.")
+                        
                 except Exception as e:
-                    st.error(f"Gagal memuat AI. Pastikan API Key valid. Detail error: {e}")
+                    st.error(f"Gagal memuat AI. Detail error: {e}")
 
         # Download Button
         st.write("---")
