@@ -10,6 +10,7 @@ import warnings
 import logging
 from functools import lru_cache
 import pulp  # Library untuk Linear Programming
+import google.generativeai as genai # Tambahan Library AI
 
 # --- SUPPRESS WARNINGS & PROPHET LOGS ---
 warnings.filterwarnings('ignore')
@@ -201,6 +202,11 @@ def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fc
         return pd.DataFrame()
 
 # --- UI SIDEBAR ---
+# 0. INTEGRASI AI
+st.sidebar.header("🤖 Integrasi AI (Opsional)")
+api_key_input = st.sidebar.text_input("Gemini API Key", type="password", help="Masukkan API Key Google AI Studio Anda di sini untuk memunculkan Executive Summary.")
+st.sidebar.divider()
+
 st.sidebar.header("📂 1. Upload Database")
 file_cof = st.sidebar.file_uploader("Upload Data COF (Interval 30 Min)", type=['csv', 'xlsx'])
 file_aht = st.sidebar.file_uploader("Upload Data AHT (Interval 30 Min)", type=['csv', 'xlsx'])
@@ -220,7 +226,6 @@ max_wait_time = st.sidebar.number_input("Target ASA (Detik)", value=20)
 max_occupancy = st.sidebar.slider("Target Max Occupancy (%)", min_value=50, max_value=100, value=85, help="Batas maksimal kesibukan agen.") / 100
 shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
 
-# PERBAIKAN: Ubah menjadi desimal dengan step 0.5 untuk mengakomodir 30 menit
 work_hours = st.sidebar.number_input("Jam Kerja per Hari (FTE)", min_value=1.0, max_value=24.0, value=8.0, step=0.5, format="%.1f", help="Gunakan angka desimal. 7.5 = 7 jam 30 menit.")
 work_days = st.sidebar.number_input("Hari Kerja/Agen/Bulan", value=22)
 shift_duration = st.sidebar.number_input("Durasi 1 Shift (Jam)", min_value=1.0, max_value=24.0, value=9.0, step=0.5, format="%.1f", help="Gunakan angka desimal. 8.5 = 8 jam 30 menit.")
@@ -417,6 +422,42 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                 df_chart = df_shift_dist.set_index('Tanggal').drop(columns=['Total_Agent_Shift'])
                 st.bar_chart(df_chart)
 
+        # ==========================================
+        # INTEGRASI GEMINI AI - EXECUTIVE SUMMARY
+        # ==========================================
+        if api_key_input:
+            st.markdown("---")
+            st.subheader("✨ AI Executive Summary")
+            with st.spinner("Mengirim data ke Gemini AI untuk dianalisis..."):
+                try:
+                    # 1. Konfigurasi Kunci API
+                    genai.configure(api_key=api_key_input)
+                    model = genai.GenerativeModel('gemini-1.5-pro')
+                    
+                    # 2. Rangkum metrik kunci agar AI paham konteksnya
+                    total_vol_sebulan = df_daily_display['Total COF'].sum()
+                    peak_agent = df_daily_display['Kebutuhan Agent (Max/Peak)'].max()
+                    avg_occ = df_result['Projected_Occupancy'].mean() * 100
+                    
+                    # 3. Merakit Prompt (Instruksi untuk AI)
+                    prompt = f"""
+                    Anda adalah Konsultan WFM Senior. Saya baru saja selesai melakukan forecasting.
+                    Berikut adalah ringkasan metrik hasil forecasting:
+                    - Total Interaksi/Volume: {total_vol_sebulan}
+                    - Kebutuhan Agen Tertinggi dalam satu hari: {peak_agent} agen
+                    - Rata-rata Proyeksi Occupancy: {avg_occ:.2f}%
+                    
+                    Berikan ringkasan eksekutif (maksimal 3 paragraf) yang profesional. 
+                    Berikan insight singkat apakah rata-rata occupancy {avg_occ:.2f}% ini sehat untuk agen (terhindar dari burnout), dan berikan saran strategis untuk penjadwalan.
+                    """
+                    
+                    # 4. Eksekusi dan Tampilkan Hasil
+                    response = model.generate_content(prompt)
+                    st.info(response.text)
+                    
+                except Exception as e:
+                    st.error(f"Gagal memuat AI. Pastikan API Key valid. Detail error: {e}")
+
         # Download Button
         st.write("---")
         output = io.BytesIO()
@@ -435,4 +476,3 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
 
     else:
         st.info("Upload file COF dan AHT untuk memulai.")
-
