@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 logging.getLogger('prophet').setLevel(logging.WARNING)
 logging.getLogger('cmdstanpy').disabled = True
 
-# --- INISIALISASI SESSION STATE (MEMORI WEB) ---
+# --- INISIALISASI SESSION STATE ---
 if 'agent_data' not in st.session_state:
     st.session_state['agent_data'] = pd.DataFrame()
 if 'shift_target' not in st.session_state:
@@ -26,7 +26,7 @@ if 'shift_target' not in st.session_state:
 st.set_page_config(page_title="WFM & Capacity Planner", layout="wide")
 st.title("WFM Forecast, Capacity & Rostering System")
 
-# --- FALLBACK KAMUS SHIFT 24 JAM (DEFAULT) ---
+# --- FALLBACK KAMUS SHIFT 24 JAM ---
 DEFAULT_SHIFTS = {
     'S1': '06:00:00', 'S2': '07:00:00', 'S2.3': '07:30:00', 'S3': '08:00:00', 
     'S3.3': '08:30:00', 'S4': '09:00:00', 'S5': '10:00:00', 'S6': '11:00:00', 
@@ -59,7 +59,6 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
             dt = row['Datetime']
             req = row[col_target]
             active_shifts_in_interval = []
-            
             for s_code, s_start_td in shift_items.items():
                 shift_start_dt = pd.to_datetime(str(d)) + s_start_td
                 shift_end_dt = shift_start_dt + pd.Timedelta(hours=shift_duration_hours)
@@ -88,10 +87,9 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
                 row_res[s_code] = 0
         row_res['Total_Agent_Shift'] = total
         results.append(row_res)
-        
     return pd.DataFrame(results)
 
-# --- FUNGSI ERLANG C ---
+# --- FUNGSI ERLANG & AI ---
 @lru_cache(maxsize=100000)
 def erlang_c_prob(agents, traffic_rounded):
     if agents <= traffic_rounded: return 1.0
@@ -107,7 +105,6 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time, interval
     traffic_rounded = round(traffic, 2)
     agents = math.ceil(traffic)
     if agents == 0: agents = 1
-    
     while True:
         prob_wait = erlang_c_prob(agents, traffic_rounded)
         if agents > traffic:
@@ -120,7 +117,6 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time, interval
         agents += 1
     return agents, asa, sl
 
-# --- FUNGSI CLEANSING & PROPHET ---
 @st.cache_data(show_spinner=False)
 def cleanse_data_hw(df, target_col, seasonal_periods=7, threshold=2.0, min_residual=15):
     series = df[target_col].ffill().bfill()
@@ -158,14 +154,12 @@ def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fc
         holidays_list.append(pd.DataFrame({'holiday': 'payday', 'ds': list(set(paydays)), 'lower_window': 0, 'upper_window': 0}))
         
     final_holidays = pd.concat(holidays_list, ignore_index=True) if holidays_list else None
-        
     try:
         model = Prophet(holidays=final_holidays, daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True, seasonality_mode='multiplicative')
         model.fit(df_prophet)
         last_hist_date = df_prophet['ds'].max()
         end_fcst_dt = pd.to_datetime(end_fcst)
         periods = (end_fcst_dt - last_hist_date).days if end_fcst_dt > last_hist_date else 0
-            
         future = model.make_future_dataframe(periods=periods, freq='D', include_history=False)
         forecast = model.predict(future)
         start_fcst_dt = pd.to_datetime(start_fcst)
@@ -177,15 +171,11 @@ def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fc
         st.error(f"Gagal memproses AI Prophet: {e}")
         return pd.DataFrame()
 
-
 # ==========================================
 # UI SIDEBAR UTAMA (NAVIGASI)
 # ==========================================
 st.sidebar.title("🧭 Navigasi Menu")
-menu = st.sidebar.radio(
-    "Pilih Halaman:",
-    ["📊 Forecast & Planner", "🗄️ Database Agent & Target", "🤖 Auto Rostering"]
-)
+menu = st.sidebar.radio("Pilih Halaman:", ["📊 Forecast & Planner", "🗄️ Database Agent & Target", "🤖 Auto Rostering"])
 st.sidebar.divider()
 
 # ==========================================
@@ -295,21 +285,16 @@ elif menu == "🗄️ Database Agent & Target":
     
     st.subheader("👥 1. Master Data Agent")
     upload_agent = st.file_uploader("📥 Upload Excel Data Agent", type=['xlsx', 'csv'])
-    
-    # Inisialisasi default jika belum upload
-    df_agent_display = st.session_state['agent_data'] if not st.session_state['agent_data'].empty else pd.DataFrame(columns=["Nama", "Skill", "Team Leader", "Gender", "ID Login"])
-
+    df_agent_display = st.session_state['agent_data'] if not st.session_state['agent_data'].empty else pd.DataFrame(columns=["Nama Agen", "Skill", "Team Leader", "Gender", "ID Login"])
     if upload_agent:
         df_agent_display = pd.read_csv(upload_agent) if upload_agent.name.endswith('csv') else pd.read_excel(upload_agent)
 
     edited_agent = st.data_editor(df_agent_display, num_rows="dynamic", use_container_width=True, height=250)
-    # Simpan perubahan secara realtime ke dalam Session State memori web
     st.session_state['agent_data'] = edited_agent
     
     st.divider()
     st.subheader("🧩 2. Target Komposisi Shift")
-    upload_comp = st.file_uploader("📥 Upload Target Komposisi (Misal: Distribusi_Shift.xlsx)", type=['xlsx', 'csv'])
-    
+    upload_comp = st.file_uploader("📥 Upload Target Komposisi", type=['xlsx', 'csv'])
     df_comp_display = st.session_state['shift_target'] if not st.session_state['shift_target'].empty else pd.DataFrame(columns=["Tanggal", "S1", "S2", "Total_Agent_Shift"])
 
     if upload_comp:
@@ -321,7 +306,6 @@ elif menu == "🗄️ Database Agent & Target":
             df_comp_display = pd.read_csv(upload_comp)
 
     edited_comp = st.data_editor(df_comp_display, num_rows="dynamic", use_container_width=True, height=250)
-    # Simpan perubahan target shift ke dalam memori web
     st.session_state['shift_target'] = edited_comp
 
 # ==========================================
@@ -329,65 +313,101 @@ elif menu == "🗄️ Database Agent & Target":
 # ==========================================
 elif menu == "🤖 Auto Rostering":
     st.header("🤖 Mesin Auto-Rostering Jadwal")
-    st.markdown("Halaman ini akan menjodohkan **Database Agent** dengan **Target Komposisi Shift** secara otomatis dan adil menggunakan algoritma pengacakan (Randomized Greedy Assignment).")
+    st.markdown("Halaman ini akan menjodohkan **Database Agent** dengan **Target Komposisi Shift** secara otomatis.")
 
     agent_df = st.session_state.get('agent_data', pd.DataFrame())
     comp_df = st.session_state.get('shift_target', pd.DataFrame())
 
     if agent_df.empty or comp_df.empty:
-        st.warning("⚠️ Data Agent atau Target Komposisi belum lengkap. Silakan lengkapi di Halaman 'Database Agent & Target' terlebih dahulu.")
+        st.warning("⚠️ Data Agent atau Target Komposisi belum lengkap. Silakan lengkapi di Halaman 'Database Agent & Target'.")
     else:
-        st.success(f"✅ Sistem mendeteksi **{len(agent_df)} Agen aktif** dan target jadwal untuk **{len(comp_df)} Hari**.")
+        st.success(f"✅ Sistem mendeteksi **{len(agent_df)} Agen aktif**.")
         
         if st.button("🚀 Jalankan Auto Roster", type="primary", use_container_width=True):
             with st.spinner("Mengacak dan mendistribusikan shift secara adil..."):
                 try:
-                    name_col = next((c for c in agent_df.columns if 'nama' in c.lower()), agent_df.columns[0])
+                    name_col = next((c for c in agent_df.columns if 'nama' in str(c).lower()), agent_df.columns[0])
                     master_agents = agent_df[name_col].dropna().astype(str).tolist()
                     roster_records = []
                     
-                    for _, row in comp_df.iterrows():
-                        date_val = row.get('Tanggal', 'Unknown Date')
+                    # --- SMART PARSER: Deteksi Format A (Tanggal sebagai Baris) vs Format B (Tanggal sebagai Kolom) ---
+                    date_col_name = None
+                    for c in comp_df.columns:
+                        if str(c).strip().lower() in ['tanggal', 'date', 'waktu', 'hari', 'datetime', 'tgl']:
+                            date_col_name = c
+                            break
+                            
+                    if date_col_name:
+                        # FORMAT A: Normal (Baris = Tanggal, Kolom = Shift)
+                        for _, row in comp_df.iterrows():
+                            raw_date = str(row[date_col_name]).strip()
+                            if raw_date.lower() in ['nat', 'nan', '']: continue
+                            date_val = raw_date.split(' ')[0] # Bersihkan jam agar rapi
+                            
+                            shift_reqs = {}
+                            for col in comp_df.columns:
+                                if col != date_col_name and str(col).strip().lower() not in ['total_agent_shift', 'total', 'unnamed: 0']:
+                                    try:
+                                        count = int(float(row[col]))
+                                        if count > 0: shift_reqs[str(col).strip()] = count
+                                    except (ValueError, TypeError):
+                                        continue
+                                        
+                            np.random.shuffle(master_agents)
+                            assigned_dict = {}
+                            agent_idx = 0
+                            for shift_code, count in shift_reqs.items():
+                                for _ in range(count):
+                                    if agent_idx < len(master_agents):
+                                        assigned_dict[master_agents[agent_idx]] = shift_code
+                                        agent_idx += 1
+                                        
+                            for ag in master_agents:
+                                if ag not in assigned_dict: assigned_dict[ag] = 'OFF'
+                            roster_records.append({'Tanggal': date_val, 'Assignments': assigned_dict})
+                            
+                    else:
+                        # FORMAT B: Transposed (Kolom = Tanggal, Baris = Shift)
+                        shift_col_name = comp_df.columns[0] # Asumsikan kolom pertama adalah nama-nama shift
                         
-                        # --- BLOK KODE YANG DIPERBAIKI (BUG FIX: SAFE PARSING) ---
-                        shift_reqs = {}
-                        for col in comp_df.columns:
-                            if col.strip().lower() not in ['tanggal', 'total_agent_shift', 'date'] and pd.notna(row[col]):
+                        for col in comp_df.columns[1:]:
+                            if str(col).strip().lower() in ['total', 'total_agent_shift', 'unnamed']: continue
+                            date_val = str(col).strip().split(' ')[0]
+                            
+                            shift_reqs = {}
+                            for _, row in comp_df.iterrows():
+                                shift_code = str(row[shift_col_name]).strip()
                                 try:
-                                    # Konversi ke float dulu untuk antisipasi nilai desimal, lalu ke integer
                                     count = int(float(row[col]))
-                                    if count > 0:
-                                        shift_reqs[col] = count
-                                except ValueError:
-                                    # Jika kolom mengandung string murni (misal judul shift 'S1'), maka diabaikan
+                                    if count > 0: shift_reqs[shift_code] = count
+                                except (ValueError, TypeError):
                                     continue
-                        # --------------------------------------------------------
-                        
-                        np.random.shuffle(master_agents)
-                        daily_assignment = {'Nama Agen': master_agents.copy()}
-                        assigned_dict = {}
-                        agent_idx = 0
-                        
-                        for shift_code, count in shift_reqs.items():
-                            for _ in range(count):
-                                if agent_idx < len(master_agents):
-                                    assigned_dict[master_agents[agent_idx]] = shift_code
-                                    agent_idx += 1
                                     
-                        for ag in master_agents:
-                            if ag not in assigned_dict:
-                                assigned_dict[ag] = 'OFF'
-                                
-                        roster_records.append({'Tanggal': date_val, 'Assignments': assigned_dict})
+                            np.random.shuffle(master_agents)
+                            assigned_dict = {}
+                            agent_idx = 0
+                            for shift_code, count in shift_reqs.items():
+                                for _ in range(count):
+                                    if agent_idx < len(master_agents):
+                                        assigned_dict[master_agents[agent_idx]] = shift_code
+                                        agent_idx += 1
+                                        
+                            for ag in master_agents:
+                                if ag not in assigned_dict: assigned_dict[ag] = 'OFF'
+                            roster_records.append({'Tanggal': date_val, 'Assignments': assigned_dict})
 
-                    final_roster = pd.DataFrame({'Nama Agen': master_agents})
-                    for record in roster_records:
-                        date_col = record['Tanggal']
-                        final_roster[date_col] = final_roster['Nama Agen'].map(record['Assignments'])
-                    
-                    final_roster = final_roster.set_index('Nama Agen')
-                    st.session_state['final_roster'] = final_roster
-                    
+                    # --- MERAKIT HASIL JADWAL ---
+                    if not roster_records:
+                        st.error("Gagal mendeteksi komposisi shift. Pastikan datanya berisi angka jumlah agen.")
+                    else:
+                        final_roster = pd.DataFrame({'Nama Agen': master_agents})
+                        for record in roster_records:
+                            date_col = record['Tanggal']
+                            final_roster[date_col] = final_roster['Nama Agen'].map(record['Assignments'])
+                        
+                        final_roster = final_roster.set_index('Nama Agen')
+                        st.session_state['final_roster'] = final_roster
+                        
                 except Exception as e:
                     st.error(f"Gagal menjalankan Auto-Roster: {e}")
 
