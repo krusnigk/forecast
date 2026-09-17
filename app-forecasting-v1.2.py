@@ -433,7 +433,7 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
                     # 1. Konfigurasi Kunci API
                     genai.configure(api_key=api_key_input)
                     # Menggunakan model Flash (Sangat cepat & stabil untuk analitik teks)
-                    model = genai.GenerativeModel('gemini-1.5-flash') 
+                    model = genai.GenerativeModel('gemini-pro')
 
                     
                     # 2. Rangkum metrik kunci agar AI paham konteksnya
