@@ -9,7 +9,8 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import warnings
 import logging
 from functools import lru_cache
-import pulp  # Library untuk Linear Programming
+import pulp 
+import google.generativeai as genai # Tambahan Library AI
 
 # --- SUPPRESS WARNINGS & PROPHET LOGS ---
 warnings.filterwarnings('ignore')
@@ -29,7 +30,7 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI ALOKASI SHIFT (PULP) - STRICT CONSTRAINT ---
+# --- FUNGSI ALOKASI SHIFT (PULP) ---
 @st.cache_data(show_spinner=False)
 def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_hours=9.0, target_mode='Base'):
     shift_items = {}
@@ -47,16 +48,13 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
     
     for d in unique_dates:
         df_day = df_process[df_process['Date'] == d].sort_values('Datetime').copy()
-        
         prob = pulp.LpProblem(f"Shift_Allocation_{d}", pulp.LpMinimize)
-        
         shift_vars = {s_code: pulp.LpVariable(f"{s_code}", lowBound=0, cat='Integer') for s_code in shift_items.keys()}
         surplus_vars = []
         
         for _, row in df_day.iterrows():
             dt = row['Datetime']
             req = row[col_target]
-            
             active_shifts_in_interval = []
             
             for s_code, s_start_td in shift_items.items():
@@ -72,17 +70,13 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
             surplus = pulp.LpVariable(f"Surplus_{interval_str}", lowBound=0)
             surplus_vars.append(surplus)
             
-            # HARD CONSTRAINT: Agent yang duty - Surplus = Target
             prob += pulp.lpSum(active_shifts_in_interval) - surplus == req, f"Req_{interval_str}"
             
-        # FUNGSI OBJEKTIF: Minimalkan total agen, sambil meratakan surplus (bobot 0.01)
         prob += pulp.lpSum([shift_vars[s_code] for s_code in shift_items.keys()]) + 0.01 * pulp.lpSum(surplus_vars)
-        
         prob.solve(pulp.PULP_CBC_CMD(msg=0))
         
         row_res = {'Tanggal': d}
         total = 0
-        
         if pulp.LpStatus[prob.status] == 'Optimal':
             for s_code in shift_items.keys():
                 val = int(shift_vars[s_code].varValue) if shift_vars[s_code].varValue is not None else 0
@@ -97,7 +91,7 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
         
     return pd.DataFrame(results)
 
-# --- FUNGSI ERLANG C ITERATIF ---
+# --- FUNGSI ERLANG C ---
 @lru_cache(maxsize=100000)
 def erlang_c_prob(agents, traffic_rounded):
     if agents <= traffic_rounded:
@@ -115,10 +109,8 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time, interval
     
     traffic = (cof * aht_seconds) / interval_seconds
     traffic_rounded = round(traffic, 2)
-    
     agents = math.ceil(traffic)
-    if agents == 0:
-        agents = 1
+    if agents == 0: agents = 1
     
     while True:
         prob_wait = erlang_c_prob(agents, traffic_rounded)
@@ -135,7 +127,7 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time, interval
         
     return agents, asa, sl
 
-# --- FUNGSI CLEANSING HOLT-WINTERS ---
+# --- FUNGSI AI DATA CLEANSING & FORECAST ---
 @st.cache_data(show_spinner=False)
 def cleanse_data_hw(df, target_col, seasonal_periods=7, threshold=2.0, min_residual=15):
     series = df[target_col].ffill().bfill()
@@ -149,20 +141,15 @@ def cleanse_data_hw(df, target_col, seasonal_periods=7, threshold=2.0, min_resid
     cleansed_series[is_anomaly] = fitted_values[is_anomaly]
     return cleansed_series, is_anomaly
 
-# --- FUNGSI PROPHET UNTUK HARIAN ---
 @st.cache_data(show_spinner=False)
 def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fcst, use_auto_payday=True):
     df_prophet = pd.DataFrame({'ds': pd.to_datetime(df_hist_daily['Date']), 'y': df_hist_daily[target_col]})
-    
     holidays_list = []
     holiday_dates = []
     
     if df_holidays is not None and not df_holidays.empty:
         if 'Tanggal' in df_holidays.columns:
-            h_df = pd.DataFrame({
-                'holiday': 'libur_nasional', 'ds': pd.to_datetime(df_holidays['Tanggal']),
-                'lower_window': 0, 'upper_window': 0
-            })
+            h_df = pd.DataFrame({'holiday': 'libur_nasional', 'ds': pd.to_datetime(df_holidays['Tanggal']), 'lower_window': 0, 'upper_window': 0})
             holidays_list.append(h_df)
             holiday_dates = pd.to_datetime(df_holidays['Tanggal']).dt.normalize().tolist()
             
@@ -182,25 +169,25 @@ def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fc
     try:
         model = Prophet(holidays=final_holidays, daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True, seasonality_mode='multiplicative')
         model.fit(df_prophet)
-        
         last_hist_date = df_prophet['ds'].max()
         end_fcst_dt = pd.to_datetime(end_fcst)
         periods = (end_fcst_dt - last_hist_date).days if end_fcst_dt > last_hist_date else 0
-            
         future = model.make_future_dataframe(periods=periods, freq='D', include_history=False)
         forecast = model.predict(future)
         
         start_fcst_dt = pd.to_datetime(start_fcst)
         future_forecast = forecast[(forecast['ds'] >= start_fcst_dt) & (forecast['ds'] <= end_fcst_dt)][['ds', 'yhat']]
         future_forecast.rename(columns={'ds': 'Date', 'yhat': f'{target_col}_daily_forecast'}, inplace=True)
-        
         future_forecast[f'{target_col}_daily_forecast'] = future_forecast[f'{target_col}_daily_forecast'].clip(lower=1)
         return future_forecast
     except Exception as e:
-        st.error(f"Gagal memproses AI Prophet pada metrik {target_col}: {e}")
+        st.error(f"Gagal memproses AI Prophet: {e}")
         return pd.DataFrame()
 
 # --- UI SIDEBAR ---
+st.sidebar.header("🔑 0. Integrasi AI (Opsional)")
+api_key_input = st.sidebar.text_input("Gemini API Key", type="password", help="Masukkan API Key untuk mengaktifkan AI Executive Summary. Dapatkan gratis di Google AI Studio.")
+
 st.sidebar.header("📂 1. Upload Database")
 file_cof = st.sidebar.file_uploader("Upload Data COF (Interval 30 Min)", type=['csv', 'xlsx'])
 file_aht = st.sidebar.file_uploader("Upload Data AHT (Interval 30 Min)", type=['csv', 'xlsx'])
@@ -208,160 +195,107 @@ file_shift = st.sidebar.file_uploader("Upload Master Shift (Opsional)", type=['c
 file_holidays = st.sidebar.file_uploader("Upload Data Libur Nasional (Opsional)", type=['csv', 'xlsx'])
 
 st.sidebar.header("⚙️ 2. Konfigurasi Target Optimasi")
-opt_target = st.sidebar.radio(
-    "Strategi Pembuatan Jadwal Shift:",
-    ["Base (Kebutuhan Murni)", "Shrinkage (Kebutuhan Ideal)"],
-    help="Base: Menghasilkan jadwal lebih efisien. Shrinkage: Jadwal sangat aman namun butuh headcount tinggi."
-)
+opt_target = st.sidebar.radio("Strategi Pembuatan Jadwal Shift:", ["Base (Kebutuhan Murni)", "Shrinkage (Kebutuhan Ideal)"])
 
 st.sidebar.header("⚙️ 3. Konfigurasi WFM")
 target_sl = st.sidebar.slider("Target Service Level (%)", min_value=50, max_value=100, value=90) / 100
 max_wait_time = st.sidebar.number_input("Target ASA (Detik)", value=20)
-max_occupancy = st.sidebar.slider("Target Max Occupancy (%)", min_value=50, max_value=100, value=85, help="Batas maksimal kesibukan agen.") / 100
+max_occupancy = st.sidebar.slider("Target Max Occupancy (%)", min_value=50, max_value=100, value=85) / 100
 shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
-
-# PERBAIKAN: Ubah menjadi desimal dengan step 0.5 untuk mengakomodir 30 menit
-work_hours = st.sidebar.number_input("Jam Kerja per Hari (FTE)", min_value=1.0, max_value=24.0, value=8.0, step=0.5, format="%.1f", help="Gunakan angka desimal. 7.5 = 7 jam 30 menit.")
+work_hours = st.sidebar.number_input("Jam Kerja per Hari (FTE)", min_value=1.0, max_value=24.0, value=8.0, step=0.5, format="%.1f")
 work_days = st.sidebar.number_input("Hari Kerja/Agen/Bulan", value=22)
-shift_duration = st.sidebar.number_input("Durasi 1 Shift (Jam)", min_value=1.0, max_value=24.0, value=9.0, step=0.5, format="%.1f", help="Gunakan angka desimal. 8.5 = 8 jam 30 menit.")
+shift_duration = st.sidebar.number_input("Durasi 1 Shift (Jam)", min_value=1.0, max_value=24.0, value=9.0, step=0.5, format="%.1f")
 
-st.sidebar.header("📊 4. Profil Intraday")
+st.sidebar.header("📊 4. Profil Intraday & Tanggal")
 months_profile = st.sidebar.slider("Gunakan Profil Interval (Bulan Terakhir)", min_value=1, max_value=12, value=3)
-
-st.sidebar.header("📅 5. Konfigurasi Tanggal")
 start_hist = st.sidebar.date_input("Mulai Data Historis", pd.to_datetime('2024-02-01'))
 end_hist = st.sidebar.date_input("Akhir Data Historis", pd.to_datetime('2026-05-25'))
 start_forecast = st.sidebar.date_input("Mulai Forecast", pd.to_datetime('2026-06-01'))
 end_forecast = st.sidebar.date_input("Akhir Forecast", pd.to_datetime('2026-06-30'))
-
 use_payday = st.sidebar.checkbox("💰 Aktifkan Auto-Payday (Tgl 1 & 25)", value=True)
 
 # --- PROSES UTAMA ---
 if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
     if file_cof and file_aht:
-        
         active_shifts = DEFAULT_SHIFTS.copy()
         if file_shift is not None:
             try:
                 df_s = pd.read_csv(file_shift) if file_shift.name.endswith('csv') else pd.read_excel(file_shift)
                 if 'Kode_Shift' in df_s.columns and 'Waktu_Mulai' in df_s.columns:
-                    df_s['Waktu_Mulai'] = df_s['Waktu_Mulai'].astype(str)
-                    active_shifts = dict(zip(df_s['Kode_Shift'], df_s['Waktu_Mulai']))
-                    st.toast("✅ Master Shift kustom berhasil dimuat!", icon="🧩")
-            except Exception as e:
-                st.warning(f"Gagal membaca file Shift. Error: {e}")
+                    active_shifts = dict(zip(df_s['Kode_Shift'], df_s['Waktu_Mulai'].astype(str)))
+            except Exception: pass
                 
-        with st.spinner("Memvalidasi, Membaca, & Pre-processing Data Historis..."):
+        with st.spinner("Pre-processing Data Historis..."):
             def robust_wfm_parser(uploaded_file, col_target):
                 df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('csv') else pd.read_excel(uploaded_file)
-                if df[col_target].dtype == 'object':
-                    df[col_target] = df[col_target].astype(str).str.replace(',', '.').astype(float)
-                
-                df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce', dayfirst=True)
+                if df[col_target].dtype == 'object': df[col_target] = df[col_target].astype(str).str.replace(',', '.').astype(float)
+                df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce', dayfirst=True).dt.round('30min')
                 df = df.dropna(subset=['Datetime']) 
-                
-                df['Datetime'] = df['Datetime'].dt.round('30min')
-                
                 mask = (df['Datetime'] >= pd.to_datetime(start_hist)) & (df['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))
-                df = df[mask].copy()
-                
-                df = df.groupby('Datetime')[col_target].first().reset_index()
+                df = df[mask].groupby('Datetime')[col_target].first().reset_index()
                 return df.set_index('Datetime').resample('30min').asfreq().fillna(0).reset_index()
 
             df_cof = robust_wfm_parser(file_cof, 'COF')
             df_aht = robust_wfm_parser(file_aht, 'AHT')
-            
-            df_holidays = None
-            if file_holidays is not None:
-                df_holidays = pd.read_csv(file_holidays) if file_holidays.name.endswith('csv') else pd.read_excel(file_holidays)
+            df_holidays = pd.read_csv(file_holidays) if file_holidays and file_holidays.name.endswith('csv') else pd.read_excel(file_holidays) if file_holidays else None
 
-        with st.spinner("Melatih Model AI & Menerapkan Intraday Profiling..."):
-            df_cof_daily_raw = df_cof.groupby(df_cof['Datetime'].dt.date)['COF'].sum().reset_index()
-            df_cof_daily_raw.columns = ['Date', 'COF']
-            df_cof_daily_raw['Date'] = pd.to_datetime(df_cof_daily_raw['Date'])
-            df_cof_daily_raw['COF_cleansed'], _ = cleanse_data_hw(df_cof_daily_raw, 'COF', seasonal_periods=7, min_residual=15)
+        with st.spinner("Melatih Model AI & Intraday Profiling..."):
+            df_cof_daily = df_cof.groupby(df_cof['Datetime'].dt.date)['COF'].sum().reset_index(name='COF')
+            df_cof_daily['Date'] = pd.to_datetime(df_cof_daily['Date'])
+            df_cof_daily['COF_cleansed'], _ = cleanse_data_hw(df_cof_daily, 'COF')
             
-            df_aht_daily_raw = df_aht.replace(0, np.nan).groupby(df_aht['Datetime'].dt.date)['AHT'].mean().reset_index()
-            df_aht_daily_raw.columns = ['Date', 'AHT']
-            df_aht_daily_raw['Date'] = pd.to_datetime(df_aht_daily_raw['Date'])
-            df_aht_daily_raw['AHT'] = df_aht_daily_raw['AHT'].ffill()
-            df_aht_daily_raw['AHT_cleansed'], _ = cleanse_data_hw(df_aht_daily_raw, 'AHT', seasonal_periods=7, min_residual=10)
+            df_aht_daily = df_aht.replace(0, np.nan).groupby(df_aht['Datetime'].dt.date)['AHT'].mean().reset_index(name='AHT')
+            df_aht_daily['Date'] = pd.to_datetime(df_aht_daily['Date'])
+            df_aht_daily['AHT_cleansed'], _ = cleanse_data_hw(df_aht_daily.ffill(), 'AHT')
 
-            forecast_cof_daily = run_prophet_daily(df_cof_daily_raw, df_holidays, 'COF_cleansed', start_forecast, end_forecast, use_auto_payday=use_payday)
-            forecast_aht_daily = run_prophet_daily(df_aht_daily_raw, df_holidays, 'AHT_cleansed', start_forecast, end_forecast, use_auto_payday=use_payday)
+            forecast_cof_daily = run_prophet_daily(df_cof_daily, df_holidays, 'COF_cleansed', start_forecast, end_forecast, use_auto_payday=use_payday)
+            forecast_aht_daily = run_prophet_daily(df_aht_daily, df_holidays, 'AHT_cleansed', start_forecast, end_forecast, use_auto_payday=use_payday)
 
-            max_hist_date = df_cof['Datetime'].max()
-            profile_start_date = max_hist_date - pd.DateOffset(months=months_profile)
-            
-            df_recent = pd.merge(
-                df_cof[df_cof['Datetime'] >= profile_start_date],
-                df_aht[df_aht['Datetime'] >= profile_start_date],
-                on='Datetime'
-            )
+            profile_start = df_cof['Datetime'].max() - pd.DateOffset(months=months_profile)
+            df_recent = pd.merge(df_cof[df_cof['Datetime'] >= profile_start], df_aht[df_aht['Datetime'] >= profile_start], on='Datetime')
             df_recent['Time'] = df_recent['Datetime'].dt.time
             df_recent['Is_Weekend'] = df_recent['Datetime'].dt.weekday >= 5
             df_recent['Date_Only'] = df_recent['Datetime'].dt.date
 
-            daily_totals = df_recent.groupby(['Date_Only', 'Is_Weekend'])['COF'].sum().reset_index(name='Daily_Total_COF')
-            df_recent = pd.merge(df_recent, daily_totals, on=['Date_Only', 'Is_Weekend'])
+            daily_tot = df_recent.groupby(['Date_Only', 'Is_Weekend'])['COF'].sum().reset_index(name='Daily_Total_COF')
+            df_recent = pd.merge(df_recent, daily_tot, on=['Date_Only', 'Is_Weekend'])
             df_recent['COF_Ratio'] = np.where(df_recent['Daily_Total_COF'] > 0, df_recent['COF'] / df_recent['Daily_Total_COF'], 0)
             
-            daily_aht_mean = df_recent.replace({'AHT': 0}, np.nan).groupby(['Date_Only', 'Is_Weekend'])['AHT'].mean().reset_index(name='Daily_Mean_AHT')
-            df_recent = pd.merge(df_recent, daily_aht_mean, on=['Date_Only', 'Is_Weekend'])
+            daily_mean = df_recent.replace({'AHT': 0}, np.nan).groupby(['Date_Only', 'Is_Weekend'])['AHT'].mean().reset_index(name='Daily_Mean_AHT')
+            df_recent = pd.merge(df_recent, daily_mean, on=['Date_Only', 'Is_Weekend'])
             df_recent['AHT_Ratio'] = np.where(df_recent['Daily_Mean_AHT'] > 0, df_recent['AHT'] / df_recent['Daily_Mean_AHT'], 1)
 
-            profile = df_recent.groupby(['Is_Weekend', 'Time']).agg(
-                COF_Ratio=('COF_Ratio', 'mean'),
-                AHT_Ratio=('AHT_Ratio', 'mean')
-            ).reset_index()
-            
-            sum_ratios_cof = profile.groupby('Is_Weekend')['COF_Ratio'].transform('sum')
-            profile['COF_Ratio'] = profile['COF_Ratio'] / sum_ratios_cof
+            profile = df_recent.groupby(['Is_Weekend', 'Time']).agg(COF_Ratio=('COF_Ratio', 'mean'), AHT_Ratio=('AHT_Ratio', 'mean')).reset_index()
+            profile['COF_Ratio'] = profile['COF_Ratio'] / profile.groupby('Is_Weekend')['COF_Ratio'].transform('sum')
 
-            forecast_dates = pd.date_range(start=start_forecast, end=end_forecast)
             reconstructed_rows = []
-            
-            for d in forecast_dates:
-                d_date = d.date()
+            for d in pd.date_range(start_forecast, end_forecast):
                 is_wkd = d.weekday() >= 5
-                
-                match_cof = forecast_cof_daily[forecast_cof_daily['Date'] == pd.to_datetime(d_date)]
-                match_aht = forecast_aht_daily[forecast_aht_daily['Date'] == pd.to_datetime(d_date)]
-                
-                if match_cof.empty or match_aht.empty: 
-                    continue
+                match_cof = forecast_cof_daily[forecast_cof_daily['Date'] == d]
+                match_aht = forecast_aht_daily[forecast_aht_daily['Date'] == d]
+                if match_cof.empty or match_aht.empty: continue
                     
-                cof_daily_val = match_cof['COF_cleansed_daily_forecast'].values[0]
-                aht_daily_val = match_aht['AHT_cleansed_daily_forecast'].values[0]
-                
                 sub_profile = profile[profile['Is_Weekend'] == is_wkd]
                 for _, p_row in sub_profile.iterrows():
-                    dt_interval = pd.Timestamp.combine(d_date, p_row['Time'])
                     reconstructed_rows.append({
-                        'Datetime': dt_interval, 
-                        'COF_forecast': cof_daily_val * p_row['COF_Ratio'],
-                        'AHT_forecast': aht_daily_val * p_row['AHT_Ratio']
+                        'Datetime': pd.Timestamp.combine(d.date(), p_row['Time']), 
+                        'COF_forecast': match_cof['COF_cleansed_daily_forecast'].values[0] * p_row['COF_Ratio'],
+                        'AHT_forecast': match_aht['AHT_cleansed_daily_forecast'].values[0] * p_row['AHT_Ratio']
                     })
                     
             df_result = pd.DataFrame(reconstructed_rows)
             df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
             
-        with st.spinner("Kalkulasi Antrean Erlang C (Include Occupancy Target)..."):
-            erlang_results = [
-                calculate_agents_erlang(cof, aht, target_sl, max_wait_time) 
-                for cof, aht in zip(df_result['COF_forecast'], df_result['AHT_forecast'])
-            ]
-            
-            df_result['Agent_for_SL'] = [res[0] for res in erlang_results]
-            df_result['Projected_Wait_Time'] = [res[1] for res in erlang_results]
-            df_result['Service_Level_Achieved'] = [res[2] for res in erlang_results]
+        with st.spinner("Kalkulasi Erlang C & Occupancy..."):
+            erlang_res = [calculate_agents_erlang(c, a, target_sl, max_wait_time) for c, a in zip(df_result['COF_forecast'], df_result['AHT_forecast'])]
+            df_result['Agent_for_SL'] = [r[0] for r in erlang_res]
+            df_result['Projected_Wait_Time'] = [r[1] for r in erlang_res]
+            df_result['Service_Level_Achieved'] = [r[2] for r in erlang_res]
             
             df_result['Traffic_Erlangs'] = (df_result['COF_forecast'] * df_result['AHT_forecast']) / 1800
             df_result['Agent_for_Occupancy'] = np.ceil(df_result['Traffic_Erlangs'] / max_occupancy)
-            
             df_result['Base_Agent_Needed'] = np.maximum(df_result['Agent_for_SL'], df_result['Agent_for_Occupancy'])
             df_result['Projected_Occupancy'] = np.where(df_result['Base_Agent_Needed'] > 0, df_result['Traffic_Erlangs'] / df_result['Base_Agent_Needed'], 0)
-            
             df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
             df_result['Date'] = df_result['Datetime'].dt.date
             
@@ -370,68 +304,76 @@ if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
             daily_headcount_needed = np.ceil(df_daily_workload_hours / work_hours)
 
             df_daily = df_result.groupby('Date').agg(
-                Total_COF=('COF_forecast', 'sum'),
-                Rata_Rata_AHT=('AHT_forecast', 'mean'),
-                Max_Kebutuhan_Agent=('Agent_Needed_Adjust', 'max'),
-                Rata_Rata_SL=('Service_Level_Achieved', 'mean'),
-                Rata_Rata_Occ=('Projected_Occupancy', 'mean')
+                Total_COF=('COF_forecast', 'sum'), Rata_Rata_AHT=('AHT_forecast', 'mean'), Max_Kebutuhan_Agent=('Agent_Needed_Adjust', 'max'),
+                Rata_Rata_SL=('Service_Level_Achieved', 'mean'), Rata_Rata_Occ=('Projected_Occupancy', 'mean')
             ).reset_index()
 
-            df_daily['Headcount_Harian_FTE'] = df_daily['Date'].map(daily_headcount_needed)
-
             df_daily_display = df_daily.copy()
+            df_daily_display.insert(3, 'Headcount_Harian_FTE', df_daily['Date'].map(daily_headcount_needed))
             df_daily_display['Total_COF'] = df_daily_display['Total_COF'].astype(int) 
             df_daily_display['Rata_Rata_AHT'] = df_daily_display['Rata_Rata_AHT'].apply(lambda x: f"{x:.0f} s")
             df_daily_display['Headcount_Harian_FTE'] = df_daily_display['Headcount_Harian_FTE'].astype(int) 
             df_daily_display['Max_Kebutuhan_Agent'] = df_daily_display['Max_Kebutuhan_Agent'].astype(int)
             df_daily_display['Rata_Rata_SL'] = df_daily_display['Rata_Rata_SL'].apply(lambda x: f"{x:.2%}")
             df_daily_display['Rata_Rata_Occ'] = df_daily_display['Rata_Rata_Occ'].apply(lambda x: f"{x:.2%}")
-            
-            df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL', 'Rata_Rata_Occ']]
             df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL', 'Proyeksi Occupancy']
 
-        with st.spinner(f"Menjalankan Optimasi Shift LP (Target: {opt_target})..."):
-            mode = 'Base' if 'Base' in opt_target else 'Adjusted'
-            df_shift_dist = optimize_shift_distribution_pulp(df_result, active_shifts, shift_duration, target_mode=mode)
+        with st.spinner(f"Optimasi Shift LP (Target: {opt_target})..."):
+            df_shift_dist = optimize_shift_distribution_pulp(df_result, active_shifts, shift_duration, target_mode='Base' if 'Base' in opt_target else 'Adjusted')
+            
+        ai_insight_text = ""
+        if api_key_input:
+            with st.spinner("🤖 Menggerakkan Gemini AI untuk menghasilkan Executive Summary..."):
+                try:
+                    genai.configure(api_key=api_key_input)
+                    model = genai.GenerativeModel('gemini-1.5-pro')
+                    prompt = f"""
+                    Bertindaklah sebagai Konsultan Senior Workforce Management (WFM) Contact Center.
+                    Saya berikan ringkasan data forecast harian di bawah ini:
+                    
+                    {df_daily_display.to_string(index=False)}
+                    
+                    Tolong berikan:
+                    1. Ringkasan singkat mengenai beban kerja bulan ini.
+                    2. Analisis hari-hari paling rawan (Peak days) berdasarkan tingginya Total COF atau Kebutuhan Agent.
+                    3. Saran operasional untuk memitigasi risiko SLA atau mencegah burnout agen pada hari rawan tersebut.
+                    Tuliskan maksimal 3 paragraf dengan format bullet points yang bersih. Jangan berhalusinasi di luar data tabel.
+                    """
+                    response = model.generate_content(prompt)
+                    ai_insight_text = response.text
+                except Exception as e:
+                    ai_insight_text = f"⚠️ Gagal menghubungi Gemini AI. Pastikan API Key valid. Detail error: {str(e)}"
 
-        st.success("🎉 Kalkulasi Optimasi Selesai!")
+        st.success("🎉 Kalkulasi & Optimasi Selesai!")
         
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "📊 Forecast", "👥 Kapasitas (Bulanan)", "📅 Hasil Harian", "⏱️ Detail Interval", "🧩 Distribusi Shift"
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            "✨ AI Insights", "📊 Forecast", "👥 Kapasitas", "📅 Harian", "⏱️ Interval", "🧩 Shift"
         ])
         
         with tab1:
-            st.line_chart(df_result.set_index('Datetime')['COF_forecast'])
+            if ai_insight_text:
+                st.markdown("### 🤖 Analisis Eksekutif WFM")
+                st.info(ai_insight_text)
+            else:
+                st.warning("Silakan masukkan API Key Gemini di sidebar untuk melihat AI Insights pada kalkulasi berikutnya.")
         with tab2:
-            st.metric("Total Headcount Manusia (FTE)", total_monthly_headcount)
+            st.line_chart(df_result.set_index('Datetime')['COF_forecast'])
         with tab3:
-            st.dataframe(df_daily_display, use_container_width=True)
+            st.metric("Total Headcount Manusia (FTE)", total_monthly_headcount)
         with tab4:
-            st.dataframe(df_result[['Datetime', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Projected_Occupancy']], use_container_width=True)
+            st.dataframe(df_daily_display, use_container_width=True)
         with tab5:
-            st.markdown(f"**Target Optimasi Terpilih: {opt_target}**")
-            st.markdown("Algoritma kini diatur dengan **Hard Constraint**: Jumlah agen tidak akan pernah di bawah batas target yang Anda pilih, sehingga Service Level di setiap interval akan terjamin.")
-            
+            st.dataframe(df_result[['Datetime', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Projected_Occupancy']], use_container_width=True)
+        with tab6:
             if not df_shift_dist.empty:
                 st.dataframe(df_shift_dist, use_container_width=True)
-                df_chart = df_shift_dist.set_index('Tanggal').drop(columns=['Total_Agent_Shift'])
-                st.bar_chart(df_chart)
+                st.bar_chart(df_shift_dist.set_index('Tanggal').drop(columns=['Total_Agent_Shift']))
 
-        # Download Button
-        st.write("---")
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             df_daily_display.to_excel(writer, sheet_name='Hasil_Harian', index=False)
-            df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Service_Level_Achieved', 'Projected_Wait_Time', 'Projected_Occupancy']].to_excel(writer, sheet_name='Detail_Interval', index=False)
-            if not df_shift_dist.empty:
-                df_shift_dist.to_excel(writer, sheet_name='Distribusi_Shift', index=False)
-        
-        st.download_button(
-            label="📥 Download Laporan Lengkap (Excel)",
-            data=output.getvalue(),
-            file_name=f"Forecast_WFM_Include_Occ_{start_forecast}_to_{end_forecast}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
+            df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Service_Level_Achieved', 'Projected_Occupancy']].to_excel(writer, sheet_name='Detail_Interval', index=False)
+            if not df_shift_dist.empty: df_shift_dist.to_excel(writer, sheet_name='Distribusi_Shift', index=False)
+        st.download_button("📥 Download Laporan (Excel)", data=output.getvalue(), file_name=f"Forecast_WFM_{start_forecast}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     else:
         st.info("Upload file COF dan AHT untuk memulai.")
