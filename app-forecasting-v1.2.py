@@ -9,7 +9,7 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import warnings
 import logging
 from functools import lru_cache
-import pulp  # Library untuk Linear Programming
+import pulp
 
 # --- SUPPRESS WARNINGS & PROPHET LOGS ---
 warnings.filterwarnings('ignore')
@@ -17,8 +17,8 @@ logging.getLogger('prophet').setLevel(logging.WARNING)
 logging.getLogger('cmdstanpy').disabled = True
 
 # --- KONFIGURASI HALAMAN ---
-st.set_page_config(page_title="WFM Forecast & Capacity Planner", layout="wide")
-st.title("WFM Forecast & Capacity Planning Tool")
+st.set_page_config(page_title="WFM & Capacity Planner", layout="wide")
+st.title("WFM Forecast, Capacity & Rostering System")
 
 # --- FALLBACK KAMUS SHIFT 24 JAM (DEFAULT) ---
 DEFAULT_SHIFTS = {
@@ -37,7 +37,6 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
         shift_items[s_code] = pd.to_timedelta(str(s_time))
         
     results = []
-    
     df_process = df_result.copy()
     df_process['Datetime'] = pd.to_datetime(df_process['Datetime'])
     df_process['Date'] = pd.to_datetime(df_process['Date']).dt.date
@@ -90,18 +89,15 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
 # --- FUNGSI ERLANG C ---
 @lru_cache(maxsize=100000)
 def erlang_c_prob(agents, traffic_rounded):
-    if agents <= traffic_rounded:
-        return 1.0
+    if agents <= traffic_rounded: return 1.0
     erlang_b_inv = 1.0
-    for i in range(1, int(agents) + 1):
-        erlang_b_inv = 1.0 + erlang_b_inv * i / traffic_rounded
+    for i in range(1, int(agents) + 1): erlang_b_inv = 1.0 + erlang_b_inv * i / traffic_rounded
     erlang_b = 1.0 / erlang_b_inv
     erlang_c = erlang_b / (1.0 - (traffic_rounded / agents) * (1.0 - erlang_b))
     return max(0.0, min(1.0, erlang_c))
 
 def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time, interval_seconds=1800):
-    if pd.isna(cof) or pd.isna(aht_seconds) or cof <= 0:
-        return 0, 0.0, 1.0
+    if pd.isna(cof) or pd.isna(aht_seconds) or cof <= 0: return 0, 0.0, 1.0
     traffic = (cof * aht_seconds) / interval_seconds
     traffic_rounded = round(traffic, 2)
     agents = math.ceil(traffic)
@@ -115,8 +111,7 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time, interval
         else:
             asa = float('inf')
             sl = 0.0
-        if sl >= target_sl:
-            break
+        if sl >= target_sl: break
         agents += 1
     return agents, asa, sl
 
@@ -184,7 +179,7 @@ def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fc
 st.sidebar.title("🧭 Navigasi Menu")
 menu = st.sidebar.radio(
     "Pilih Halaman:",
-    ["📊 Forecast & Planner", "📅 Schedule Viewer"]
+    ["📊 Forecast & Planner", "🗄️ Database Agent & Target Shift"]
 )
 st.sidebar.divider()
 
@@ -382,67 +377,86 @@ if menu == "📊 Forecast & Planner":
             st.info("Upload file COF dan AHT untuk memulai.")
 
 # ==========================================
-# HALAMAN 2: SCHEDULE VIEWER (ROSTER)
+# HALAMAN 2: DATABASE AGENT & KOMPOSISI SHIFT
 # ==========================================
-elif menu == "📅 Schedule Viewer":
-    st.header("Viewer Jadwal Operasional (Roster)")
-    st.markdown("Unggah file Excel jadwal harian Anda. Sistem akan otomatis mendeteksi kolom nama, mewarnai shift (OFF, CT, OR), dan menghitung agen yang bertugas.")
+elif menu == "🗄️ Database Agent & Target Shift":
+    st.header("🗄️ Manajemen Database Agent & Komposisi Shift")
+    st.markdown("Halaman ini berfungsi sebagai persiapan menuju sistem **Auto-Rostering**. Kelola data agen secara langsung dan tentukan target komposisi shift harian Anda.")
     
-    upload_roster = st.file_uploader("📥 Upload Laporan Excel Jadwal (Roster)", type=['xlsx', 'csv'])
-    header_row = st.number_input("Header ada di baris ke-berapa? (Ubah jika tabel terlihat aneh)", min_value=0, max_value=5, value=0, help="Default 0 (baris pertama). Jika Excel Anda menggunakan 2 baris untuk tanggal, coba ubah ke 1 atau 2.")
+    st.divider()
     
-    if upload_roster:
-        with st.spinner("Memproses dan merender jadwal..."):
-            try:
-                if upload_roster.name.endswith('csv'):
-                    df_roster = pd.read_csv(upload_roster, header=header_row)
+    # --- BAGIAN 1: MASTER DATA AGENT ---
+    st.subheader("👥 1. Master Data Agent")
+    st.markdown("Unggah file Excel daftar agen Anda. Anda dapat **mengedit data (tambah/hapus baris) langsung di dalam tabel**, lalu mengunduh hasilnya untuk disimpan.")
+    
+    upload_agent = st.file_uploader("📥 Upload Master Data Agent (Excel/CSV)", type=['xlsx', 'csv'], key="agent_upload")
+    
+    if upload_agent:
+        try:
+            if upload_agent.name.endswith('csv'):
+                df_agent = pd.read_csv(upload_agent)
+            else:
+                df_agent = pd.read_excel(upload_agent)
+            
+            # Menampilkan Data Editor interaktif
+            edited_agent_df = st.data_editor(
+                df_agent, 
+                num_rows="dynamic", # Memungkinkan penambahan & penghapusan baris via web UI
+                use_container_width=True,
+                height=350
+            )
+            
+            # Tombol Download untuk menyimpan modifikasi
+            output_agent = io.BytesIO()
+            with pd.ExcelWriter(output_agent, engine='xlsxwriter') as writer:
+                edited_agent_df.to_excel(writer, index=False, sheet_name="Master_Agent")
+            
+            st.download_button(
+                label="💾 Download Master Data Agent (Terbaru)",
+                data=output_agent.getvalue(),
+                file_name="Updated_Master_Agent.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
+        except Exception as e:
+            st.error(f"⚠️ Gagal membaca file Master Agent: {e}")
+            
+    st.divider()
+    
+    # --- BAGIAN 2: KOMPOSISI SHIFT ---
+    st.subheader("🧩 2. Target Komposisi Shift Harian")
+    st.markdown("Unggah file target kebutuhan agen per shift. Anda bisa menggunakan file Excel hasil *download* dari halaman Forecast.")
+    
+    upload_comp = st.file_uploader("📥 Upload Target Komposisi Shift (Excel)", type=['xlsx', 'csv'], key="comp_upload")
+    
+    if upload_comp:
+        try:
+            if upload_comp.name.endswith('csv'):
+                df_comp = pd.read_csv(upload_comp)
+            else:
+                # Otomatis mencoba membaca sheet 'Distribusi_Shift' jika berasal dari halaman 1
+                xls = pd.ExcelFile(upload_comp)
+                if 'Distribusi_Shift' in xls.sheet_names:
+                    df_comp = pd.read_excel(upload_comp, sheet_name='Distribusi_Shift')
                 else:
-                    df_roster = pd.read_excel(upload_roster, header=header_row)
-
-                df_roster.columns = [str(c).strip() for c in df_roster.columns]
+                    df_comp = pd.read_excel(upload_comp)
+            
+            # Ubah format tanggal agar terlihat rapi di web
+            if 'Tanggal' in df_comp.columns:
+                df_comp['Tanggal'] = pd.to_datetime(df_comp['Tanggal']).dt.strftime('%Y-%m-%d')
                 
-                name_col = next((col for col in df_roster.columns if 'nama' in col.lower()), None)
-                if name_col:
-                    df_roster = df_roster.dropna(subset=[name_col])
-                    df_roster = df_roster.set_index(name_col)
-                else:
-                    st.warning("⚠️ Kolom 'Nama' tidak ditemukan secara otomatis. Tampilan mungkin tidak terkunci di nama agen.")
-
-                def style_schedule(val):
-                    if pd.isna(val) or str(val).strip() == '':
-                        return ''
-                    val_str = str(val).strip().upper()
-                    if val_str == 'OFF':
-                        return 'background-color: #ff0000; color: white; font-weight: bold; text-align: center;'
-                    elif val_str in ['CT', 'OR', 'CUTI', 'LEAVE']:
-                        return 'background-color: #ffe599; color: black; font-weight: bold; text-align: center;'
-                    elif val_str.startswith('S') or val_str[0].isdigit():
-                        return 'background-color: #e6f2ff; color: #004085; text-align: center;'
-                    return 'text-align: center;'
-
-                styled_roster = df_roster.style.map(style_schedule)
-                st.subheader("📋 Roster Agen")
-                st.dataframe(styled_roster, use_container_width=True, height=600)
+            edited_comp_df = st.data_editor(
+                df_comp,
+                num_rows="dynamic",
+                use_container_width=True,
+                height=350
+            )
+            
+            # Tampilkan Grafik Tren jika datanya sesuai format Halaman 1
+            if 'Tanggal' in edited_comp_df.columns and 'Total_Agent_Shift' in edited_comp_df.columns:
+                st.write("**Grafik Tren Total Kebutuhan Agen Harian**")
+                chart_data = edited_comp_df.set_index('Tanggal')['Total_Agent_Shift']
+                st.bar_chart(chart_data)
                 
-                ignore_keywords = ['skill', 'no', 'agent lead', 'gender', 'religi', 'perner', 'id login', 'note', 'team']
-                date_columns = [col for col in df_roster.columns if not any(kw in str(col).lower() for kw in ignore_keywords)]
-                
-                if date_columns:
-                    st.divider()
-                    st.subheader("📊 Tren Ketersediaan Agen Harian")
-                    summary_data = []
-                    for col in date_columns:
-                        if df_roster[col].dropna().empty: continue
-                        total_agents = len(df_roster[col].dropna())
-                        total_off = df_roster[col].astype(str).str.upper().isin(['OFF', 'CT', 'OR', 'CUTI']).sum()
-                        total_duty = total_agents - total_off
-                        summary_data.append({'Tanggal': col, 'On Duty': total_duty, 'OFF / Cuti': total_off})
-                    
-                    if summary_data:
-                        df_summary = pd.DataFrame(summary_data).set_index('Tanggal')
-                        st.bar_chart(df_summary, color=['#1f77b4', '#ff4c4c'])
-                    else:
-                        st.info("Tidak ada data tanggal yang valid untuk dibuatkan grafik ringkasan.")
-
-            except Exception as e:
-                st.error(f"⚠️ Gagal membaca format Excel. Detail Error: {e}")
+        except Exception as e:
+            st.error(f"⚠️ Gagal membaca file Komposisi Shift: {e}")
