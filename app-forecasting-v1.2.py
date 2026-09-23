@@ -181,7 +181,7 @@ menu = st.sidebar.radio("Pilih Halaman:", ["📊 Forecast & Planner", "🗄️ D
 st.sidebar.divider()
 
 # ==========================================
-# HALAMAN 1 & 2 (Diringkas agar fokus ke Halaman 3)
+# HALAMAN 1 & 2
 # ==========================================
 if menu == "📊 Forecast & Planner":
     st.header("WFM Forecast & Capacity Planning")
@@ -322,7 +322,7 @@ elif menu == "🗄️ Database Agent & Target":
     st.session_state['shift_target'] = edited_comp
 
 # ==========================================
-# HALAMAN 3: AUTO ROSTERING MACHINE (UPDATED LATEST RULES)
+# HALAMAN 3: AUTO ROSTERING MACHINE (EQUITY UPDATE)
 # ==========================================
 elif menu == "🤖 Auto Rostering":
     st.header("🤖 Mesin Auto-Rostering Berbasis Ketersediaan & Keadilan")
@@ -404,11 +404,11 @@ elif menu == "🤖 Auto Rostering":
             target_work = total_days - leave_count_target - target_off_or
             total_capacity += max(0, target_work)
             
-            # --- BUFFER PARSING (MEMBACA HISTORI) ---
+            # --- BUFFER PARSING ---
             last_shift_val = None
             consecutive_work_buffer = 0
             s11_count_buffer = 0
-            s11_chain_active = True # Logika berantai untuk 3x S11 berturut-turut
+            s11_chain_active = True 
             
             if buffer_dates:
                 for buf_col in reversed(buffer_dates):
@@ -418,7 +418,6 @@ elif menu == "🤖 Auto Rostering":
                             last_shift_val = val
                         consecutive_work_buffer += 1
                         
-                        # Hitung beruntun S11 di akhir bulan
                         if val == 'S11' and s11_chain_active:
                             s11_count_buffer += 1
                         else:
@@ -444,13 +443,11 @@ elif menu == "🤖 Auto Rostering":
         col3.metric("Selisih Keseluruhan", gap)
         st.divider()
 
-        # LOGIKA INTI PENGECEKAN ELIGIBILITY AGEN (UPDATED: Look-ahead & S11 Cap)
         def is_agent_eligible(shift_code, gender, kondisi, last_shift, tomorrow_status='', s11_count=0):
             is_hamil = str(kondisi).strip().upper() == 'HAMIL'
             gender = str(gender).strip().upper()
             if gender not in ['P', 'L']: gender = 'P'
 
-            # 1. Aturan Gender & Kondisi (Hamil)
             if is_hamil:
                 if shift_code not in ['S1', 'S2', 'S2.3', 'S3']: return False
             else:
@@ -459,17 +456,13 @@ elif menu == "🤖 Auto Rostering":
                 if gender == 'P' and num > 6.0: return False
                 if gender == 'L' and num < 4.0: return False
                 
-            # 2. Aturan H-1 Cuti/CT (Look-ahead)
             if tomorrow_status in ['CT', 'CUTI', 'SICK', 'TRAINING']:
-                # Dilarang assign shift malam (S19, S20, S11) jika besoknya libur panjang/cuti
                 if shift_code in ['S19', 'S20', 'S11']:
                     return False
                     
-            # 3. Aturan 3x S11 berturut-turut
             if shift_code == 'S11' and s11_count >= 3:
                 return False
                 
-            # 4. Aturan Anti-Jumping (Mundur Maks 1 Jam)
             if last_shift and last_shift in DEFAULT_SHIFTS and shift_code in DEFAULT_SHIFTS:
                 t_last = pd.to_timedelta(DEFAULT_SHIFTS[last_shift])
                 t_curr = pd.to_timedelta(DEFAULT_SHIFTS[shift_code])
@@ -479,13 +472,12 @@ elif menu == "🤖 Auto Rostering":
             return True
 
         if st.button(f"🚀 Jalankan Auto Roster ({target_month_name})", type="primary", use_container_width=True):
-            with st.spinner("Memproses logika antrean, look-ahead, & keadilan shift..."):
+            with st.spinner("Menyeimbangkan Keadilan S11 & memproses jadwal..."):
                 try:
                     agent_stats = {}
                     for idx in roster_df.index:
                         init_st = agent_initial_stats[idx]
                         
-                        # Inisiasi mandatory off jika di akhir bulan lalu sudah sentuh batas
                         mand_off = 0
                         if init_st['initial_consecutive_work'] >= 5 or init_st['initial_s11_count'] >= 3:
                             mand_off = 2
@@ -497,6 +489,7 @@ elif menu == "🤖 Auto Rostering":
                             'yesterday_status': 'WORK' if init_st['initial_last_shift'] else 'OFF',
                             'consecutive_work': init_st['initial_consecutive_work'],
                             's11_consecutive_count': init_st['initial_s11_count'],
+                            's11_total_count': 0, # NEW: Tracker total S11 sebulan untuk equity
                             'mandatory_off_remaining': mand_off,
                             'last_shift': init_st['initial_last_shift']
                         }
@@ -515,7 +508,6 @@ elif menu == "🤖 Auto Rostering":
                                     break
                             except: pass
                             
-                        # LOOK-AHEAD: Cari tau status besok untuk pengecekan aturan H-1 Cuti
                         tomorrow_date_str = (pd.to_datetime(target_date_str) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
                         tomorrow_col = None
                         for col in roster_df.columns:
@@ -530,14 +522,13 @@ elif menu == "🤖 Auto Rostering":
                             is_in_mask = roster_df[matching_col].astype(str).str.strip().str.upper() == 'IN'
                             available_indices = roster_df[is_in_mask].index.tolist()
 
-                            # 1. Saring agen yang wajib OFF karena sudah 5 HK atau 3x S11
                             eligible_for_work_indices = []
                             for idx in available_indices:
                                 if agent_stats[idx]['mandatory_off_remaining'] > 0:
                                     continue
                                 eligible_for_work_indices.append(idx)
 
-                            # 2. SCORING AGEN
+                            # SCORING REGULER (Berdasarkan jumlah kebutuhan hari kerja)
                             priority_scores = []
                             for idx in eligible_for_work_indices:
                                 stats = agent_stats[idx]
@@ -550,12 +541,24 @@ elif menu == "🤖 Auto Rostering":
                                 priority_scores.append((score, idx))
                             
                             priority_scores.sort(key=lambda x: x[0], reverse=True)
-                            sorted_available_indices = [x[1] for x in priority_scores]
+                            base_sorted_available_indices = [x[1] for x in priority_scores]
                             
                             assigned_this_day = set()
 
-                            # 3. ALOKASI SHIFT
+                            # ALOKASI SHIFT
                             for s_code, count in shift_reqs.items():
+                                
+                                # === EQUITY SORTER: S11 LOAD BALANCING ===
+                                if s_code == 'S11':
+                                    # Tarik agen dengan S11 Total paling sedikit ke antrean terdepan
+                                    sorted_available_indices = sorted(
+                                        base_sorted_available_indices,
+                                        key=lambda idx: (agent_stats[idx]['s11_total_count'], np.random.uniform())
+                                    )
+                                else:
+                                    sorted_available_indices = base_sorted_available_indices
+                                # =========================================
+
                                 for _ in range(count):
                                     for target_row in sorted_available_indices:
                                         if target_row in assigned_this_day: continue
@@ -565,12 +568,10 @@ elif menu == "🤖 Auto Rostering":
                                         last_s = agent_stats[target_row]['last_shift']
                                         s11_tracker = agent_stats[target_row]['s11_consecutive_count']
                                         
-                                        # Ambil status besok
                                         tomorrow_status = ''
                                         if tomorrow_col:
                                             tomorrow_status = str(roster_df.at[target_row, tomorrow_col]).strip().upper()
                                         
-                                        # Pass parameter ke fungsi eligibility
                                         if is_agent_eligible(s_code, gender, kondisi, last_s, tomorrow_status, s11_tracker):
                                             roster_df.at[target_row, matching_col] = s_code
                                             agent_stats[target_row]['worked'] += 1
@@ -579,13 +580,13 @@ elif menu == "🤖 Auto Rostering":
                                             agent_stats[target_row]['consecutive_work'] += 1
                                             agent_stats[target_row]['consecutive_count'] = 0
                                             
-                                            # Update S11 Tracker
+                                            # Update S11 Trackers
                                             if s_code == 'S11':
                                                 agent_stats[target_row]['s11_consecutive_count'] += 1
+                                                agent_stats[target_row]['s11_total_count'] += 1 # Tambah Total Bulanan
                                             else:
                                                 agent_stats[target_row]['s11_consecutive_count'] = 0
                                             
-                                            # Triger Double OFF jika sentuh limit
                                             if agent_stats[target_row]['s11_consecutive_count'] >= 3:
                                                 agent_stats[target_row]['mandatory_off_remaining'] = max(agent_stats[target_row]['mandatory_off_remaining'], 2)
                                             elif agent_stats[target_row]['consecutive_work'] >= 5:
@@ -594,7 +595,7 @@ elif menu == "🤖 Auto Rostering":
                                             assigned_this_day.add(target_row)
                                             break
 
-                            # 4. ALOKASI SISA AGEN (SPILLOVER KERJA ATAU OFF)
+                            # ALOKASI SISA AGEN (SPILLOVER KERJA ATAU OFF)
                             for target_row in available_indices:
                                 if target_row not in assigned_this_day:
                                     gender = str(roster_df.at[target_row, gender_col]).strip().upper() if gender_col else 'P'
@@ -612,13 +613,11 @@ elif menu == "🤖 Auto Rostering":
                                         fallback_shift = None
                                         candidates = ['S3'] if is_hamil else (['S3', 'S4', 'S5', 'S6'] if gender == 'P' else ['S4', 'S5', 'S6', 'S10.3', 'S11'])
                                         for cand in candidates:
-                                            # Test fallback dengan rules
                                             if is_agent_eligible(cand, gender, kondisi, agent_stats[target_row]['last_shift'], tomorrow_status, agent_stats[target_row]['s11_consecutive_count']):
                                                 fallback_shift = cand
                                                 break
                                         
                                         if not fallback_shift:
-                                            # Jika tetap mentok, downgrade ke shift aman
                                             fallback_shift = 'S3' if gender == 'P' else 'S6'
                                             
                                         roster_df.at[target_row, matching_col] = fallback_shift
@@ -630,6 +629,7 @@ elif menu == "🤖 Auto Rostering":
                                         
                                         if fallback_shift == 'S11':
                                             agent_stats[target_row]['s11_consecutive_count'] += 1
+                                            agent_stats[target_row]['s11_total_count'] += 1 # Update Fallback Tracker
                                         else:
                                             agent_stats[target_row]['s11_consecutive_count'] = 0
                                             
@@ -638,7 +638,6 @@ elif menu == "🤖 Auto Rostering":
                                         elif agent_stats[target_row]['consecutive_work'] >= 5:
                                             agent_stats[target_row]['mandatory_off_remaining'] = max(agent_stats[target_row]['mandatory_off_remaining'], 2)
                                     else:
-                                        # Berikan OFF
                                         roster_df.at[target_row, matching_col] = 'OFF'
                                         if agent_stats[target_row]['yesterday_status'] in ['OFF', 'OR']:
                                             agent_stats[target_row]['consecutive_count'] += 1
@@ -652,7 +651,7 @@ elif menu == "🤖 Auto Rostering":
                                         
                                     assigned_this_day.add(target_row)
                             
-                            # 5. UPDATE STATUS NON-IN (CUTI/OR)
+                            # UPDATE STATUS NON-IN (CUTI/OR)
                             not_in_mask = roster_df[matching_col].astype(str).str.strip().str.upper() != 'IN'
                             for idx in roster_df[not_in_mask].index:
                                 val = str(roster_df.at[idx, matching_col]).strip().upper()
@@ -676,8 +675,10 @@ elif menu == "🤖 Auto Rostering":
                                     agent_stats[idx]['yesterday_status'] = 'WORK'
                                     agent_stats[idx]['last_shift'] = val
                                     agent_stats[idx]['consecutive_work'] += 1
+                                    
                                     if val == 'S11':
                                         agent_stats[idx]['s11_consecutive_count'] += 1
+                                        agent_stats[idx]['s11_total_count'] += 1 # Update Non-IN Tracker
                                     else:
                                         agent_stats[idx]['s11_consecutive_count'] = 0
                                         
