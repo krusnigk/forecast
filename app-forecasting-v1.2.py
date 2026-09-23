@@ -5,6 +5,7 @@ import math
 import io
 import datetime
 import re
+import traceback
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import warnings
@@ -330,7 +331,7 @@ elif menu == "🤖 Auto Rostering":
     st.header("🤖 Mesin Auto-Rostering Berbasis Ketersediaan & Keadilan")
 
     st.sidebar.header("⚙️ Aturan Keadilan Jadwal")
-    target_off_or = st.sidebar.number_input("Target Jumlah OFF + OR / Bulan (September)", min_value=4, max_value=15, value=10)
+    target_off_or = st.sidebar.number_input("Target Jumlah OFF + OR / Bulan (Bulan Target)", min_value=4, max_value=15, value=10)
     target_consecutive = st.sidebar.slider("Target Double OFF/OR berdekatan", min_value=0, max_value=4, value=2)
     
     agent_df = st.session_state.get('agent_data', pd.DataFrame())
@@ -357,70 +358,90 @@ elif menu == "🤖 Auto Rostering":
                 raw_date = str(row[date_col_name]).strip()
                 if raw_date.lower() in ['nat', 'nan', '']: continue
                 try:
-                    date_str = pd.to_datetime(raw_date.split(' ')[0]).strftime('%Y-%m-%d')
-                    # Hanya ambil target bulan September (>= 2026-09-01)
-                    if date_str >= '2026-09-01':
-                        reqs = {}
-                        for col in comp_df.columns:
-                            if col != date_col_name and str(col).strip().lower() not in ['total_agent_shift', 'total', 'unnamed: 0']:
-                                try:
-                                    val = int(float(row[col]))
-                                    if val > 0: reqs[str(col).strip()] = val
-                                except: pass
+                    date_obj = pd.to_datetime(raw_date.split(' ')[0])
+                    date_str = date_obj.strftime('%Y-%m-%d')
+                    
+                    reqs = {}
+                    for col in comp_df.columns:
+                        if col != date_col_name and str(col).strip().lower() not in ['total_agent_shift', 'total', 'unnamed: 0']:
+                            try:
+                                val = int(float(row[col]))
+                                if val > 0: reqs[str(col).strip()] = val
+                            except: pass
+                    
+                    if reqs:  # Pastikan ada target yang bisa diolah
                         daily_targets[date_str] = reqs
                 except: pass
 
-        # --- INITIAL STATE READER (MENGANALISIS RIWAYAT AKHIR AGUSTUS) ---
-        september_dates = sorted([c for c in roster_df.columns if str(c).startswith('2026-09')])
-        august_dates = sorted([c for c in roster_df.columns if str(c).startswith('2026-08')])
+        # --- DYNAMIC DATE AUTO-DETECTOR ---
+        # 1. Cari semua kolom berformat tanggal di file Workplace
+        date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+        all_date_cols = [str(c).strip() for c in roster_df.columns if date_pattern.match(str(c).strip())]
+        all_date_cols.sort()
+        
+        # 2. Tentukan Tanggal Target (Mulai Bulan Aktif) berdasarkan Target Komposisi yang masuk
+        if daily_targets:
+            start_target_date = min(daily_targets.keys())
+        else:
+            start_target_date = "2099-12-31" # Fallback safety
+            
+        # 3. Belah data menjadi Buffer (Histori) dan Target (Bulan Aktif)
+        target_dates = [c for c in all_date_cols if c >= start_target_date]
+        buffer_dates = [c for c in all_date_cols if c < start_target_date]
+        
+        # Buat label dinamis untuk UI
+        if start_target_date != "2099-12-31":
+            target_month_name = pd.to_datetime(start_target_date).strftime('%B %Y')
+        else:
+            target_month_name = "Bulan Berjalan"
         
         total_required_shifts = sum(sum(reqs.values()) for reqs in daily_targets.values())
-        total_days = len(september_dates) # Hanya menghitung hari di bulan September untuk target OFF
+        total_days = len(target_dates) # Hanya menghitung hari di bulan aktif untuk target OFF
         total_capacity = 0
         agent_initial_stats = {}
         
         for idx in roster_df.index:
-            # 1. Hitung jatah kerja bulan September murni
-            leave_count_sep = 0
-            or_count_sep = 0
-            for col in september_dates:
+            # 1. Hitung jatah kerja bulan Target murni
+            leave_count_target = 0
+            or_count_target = 0
+            for col in target_dates:
                 val = str(roster_df.at[idx, col]).strip().upper()
-                if val in ['CT', 'CUTI', 'SICK', 'TRAINING']: leave_count_sep += 1
-                elif val == 'OR': or_count_sep += 1
+                if val in ['CT', 'CUTI', 'SICK', 'TRAINING']: leave_count_target += 1
+                elif val == 'OR': or_count_target += 1
                 
-            target_work = total_days - leave_count_sep - target_off_or
+            target_work = total_days - leave_count_target - target_off_or
             total_capacity += max(0, target_work)
             
-            # 2. Inisialisasi state awal dari riwayat Agustus (Initial State Reader)
+            # 2. Inisialisasi state awal dari riwayat Buffer (Initial State Reader Dinamis)
             last_shift_val = None
-            consecutive_work_aug = 0
+            consecutive_work_buffer = 0
             
-            if august_dates:
-                # Cek mundur dari tanggal 31 Agustus ke belakang untuk status H-1 dan 5 HK
-                for aug_col in reversed(august_dates):
-                    val = str(roster_df.at[idx, aug_col]).strip().upper()
+            if buffer_dates:
+                # Cek mundur dari tanggal terakhir di buffer ke belakang
+                for buf_col in reversed(buffer_dates):
+                    val = str(roster_df.at[idx, buf_col]).strip().upper()
                     if val.startswith('S') or val[0].isdigit():
                         if last_shift_val is None:
-                            last_shift_val = val # Ambil shift terakhir yang dikerjakan di Agustus
-                        consecutive_work_aug += 1
+                            last_shift_val = val # Ambil shift terakhir
+                        consecutive_work_buffer += 1
                     elif val in ['OFF', 'OR', 'CT', 'CUTI', 'SICK', 'TRAINING']:
-                        # Ketemu hari libur di akhir Agustus, putus hitungan beruntunnya
+                        # Ketemu hari libur di buffer, putus hitungan beruntun
                         break
             
             agent_initial_stats[idx] = {
                 'target_work': target_work,
-                'leave_count': leave_count_sep,
-                'pre_or': or_count_sep,
+                'leave_count': leave_count_target,
+                'pre_or': or_count_target,
                 'initial_last_shift': last_shift_val,
-                'initial_consecutive_work': min(consecutive_work_aug, 5) # Maksimal cap di 5
+                'initial_consecutive_work': min(consecutive_work_buffer, 5) # Maksimal cap di 5
             }
             
         gap = total_capacity - total_required_shifts
 
-        st.subheader("🧮 Kalkulator Kapasitas vs Kebutuhan (Bulan September)")
+        st.subheader(f"🧮 Kalkulator Kapasitas vs Kebutuhan ({target_month_name})")
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total Kebutuhan Shift (September)", total_required_shifts)
-        col2.metric("Total Kapasitas Agen (Kerja)", total_capacity)
+        col1.metric("Total Kebutuhan Shift", total_required_shifts)
+        col2.metric("Total Kapasitas Agen", total_capacity)
         col3.metric("Selisih Keseluruhan", gap)
         st.divider()
 
@@ -447,10 +468,10 @@ elif menu == "🤖 Auto Rostering":
                     
             return True
 
-        if st.button("🚀 Jalankan Auto Roster (September)", type="primary", use_container_width=True):
-            with st.spinner("Membaca riwayat Agustus & mengalokasikan shift September..."):
+        if st.button(f"🚀 Jalankan Auto Roster ({target_month_name})", type="primary", use_container_width=True):
+            with st.spinner("Memproses logika antrean & keadilan shift..."):
                 try:
-                    # Inisialisasi Tracker Stateful dengan data awal dari Agustus
+                    # Inisialisasi Tracker Stateful dengan data awal dari Buffer (Histori)
                     agent_stats = {}
                     for idx in roster_df.index:
                         init_st = agent_initial_stats[idx]
@@ -482,7 +503,7 @@ elif menu == "🤖 Auto Rostering":
                             is_in_mask = roster_df[matching_col].astype(str).str.strip().str.upper() == 'IN'
                             available_indices = roster_df[is_in_mask].index.tolist()
 
-                            # 1. Saring agen yang wajib OFF karena sudah 5 HK (termasuk carry-over dari Agustus)
+                            # 1. Saring agen yang wajib OFF karena sudah 5 HK
                             eligible_for_work_indices = []
                             for idx in available_indices:
                                 if agent_stats[idx]['mandatory_off_remaining'] > 0:
@@ -600,7 +621,9 @@ elif menu == "🤖 Auto Rostering":
                     st.session_state['final_roster'] = final_roster
                     
                 except Exception as e:
-                    st.error(f"Gagal memproses Auto-Roster: {e}")
+                    # Menambahkan pelacakan error yang akurat (traceback)
+                    error_details = traceback.format_exc()
+                    st.error(f"Terjadi kesalahan saat memproses data:\n{e}\n\nDetail Sistem:\n{error_details}")
 
         if 'final_roster' in st.session_state:
             df_roster = st.session_state['final_roster']
@@ -614,17 +637,17 @@ elif menu == "🤖 Auto Rostering":
                 elif val_str.startswith('S') or val_str[0].isdigit(): return 'background-color: #e6f2ff; color: #004085; font-weight: bold; text-align: center;'
                 return 'text-align: center;'
 
-            st.subheader("📋 Hasil Jadwal Roster Otomatis (September)")
+            st.subheader(f"📋 Hasil Jadwal Roster Otomatis ({target_month_name})")
             st.dataframe(df_roster.style.map(style_auto_roster), use_container_width=True, height=500)
             
             out_excel = io.BytesIO()
             with pd.ExcelWriter(out_excel, engine='xlsxwriter') as writer:
-                df_roster.to_excel(writer, sheet_name="Roster_September")
+                df_roster.to_excel(writer, sheet_name=f"Roster_{target_month_name}")
                 
             st.download_button(
                 label="📥 Download Jadwal Excel",
                 data=out_excel.getvalue(),
-                file_name="Fairness_Based_Roster_September.xlsx",
+                file_name=f"Fairness_Based_Roster_{target_month_name.replace(' ', '_')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary"
             )
