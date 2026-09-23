@@ -405,10 +405,10 @@ elif menu == "🤖 Auto Rostering":
             num = float(match.group())
             allowed = []
             if num <= 6.0: allowed.append('P')
-            if num >= 6.0: allowed.append('L')
+            if num >= 4.0: allowed.append('L') # UPDATE: Laki-laki kini bisa dari S4
             return allowed
 
-        if st.button("🚀 Jalankan Auto Roster (Fixed Hamil OFFs)", type="primary", use_container_width=True):
+        if st.button("🚀 Jalankan Auto Roster (Tuned Gender Access)", type="primary", use_container_width=True):
             with st.spinner("Mengalokasikan shift secara adil..."):
                 try:
                     agent_stats = {idx: {'worked': 0, 'off_or_count': agent_initial_stats[idx]['pre_or'], 'consecutive_count': 0, 'yesterday_status': None} for idx in roster_df.index}
@@ -459,7 +459,7 @@ elif menu == "🤖 Auto Rostering":
                                 
                                 # A. Paksaan Kerja / Spillover (Karena OFF sudah mencapai batas target)
                                 if agent_stats[target_row]['off_or_count'] >= target_off_or:
-                                    assigned_shift = 'S3' if (gender == 'P' or is_hamil) else 'S6'
+                                    assigned_shift = 'S3' if (gender == 'P' or is_hamil) else 'S4' # UPDATE: Spillover laki-laki di S4
                                     
                                 # B. Alokasi Normal (Jika masih ada slot yang dibutuhkan hari ini)
                                 elif sisa_kebutuhan > 0:
@@ -467,7 +467,6 @@ elif menu == "🤖 Auto Rostering":
                                         assigned_shift = 'S3'
                                         if shift_reqs.get('S3', 0) > 0:
                                             shift_reqs['S3'] -= 1
-                                        # Jika shift S3 habis, agen hamil tetap masuk S3 sebagai agen ekstra
                                     else:
                                         for s_code in list(shift_reqs.keys()):
                                             if shift_reqs[s_code] > 0 and gender in get_allowed_genders(s_code):
@@ -481,7 +480,6 @@ elif menu == "🤖 Auto Rostering":
                                     agent_stats[target_row]['worked'] += 1
                                     agent_stats[target_row]['yesterday_status'] = 'WORK'
                                 else:
-                                    # Agen jatuh ke sini jika sisa_kebutuhan == 0, atau tidak ada shift yg cocok dgn gendernya
                                     roster_df.at[target_row, matching_col] = 'OFF'
                                     if agent_stats[target_row]['yesterday_status'] in ['OFF', 'OR']:
                                         agent_stats[target_row]['consecutive_count'] += 1
