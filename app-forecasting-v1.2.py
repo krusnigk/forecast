@@ -4,6 +4,7 @@ import numpy as np
 import math
 import io
 import datetime
+import re
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import warnings
@@ -284,10 +285,10 @@ elif menu == "🗄️ Database Agent & Target":
     st.header("🗄️ Manajemen Database Agent & Target Komposisi")
     
     st.subheader("👥 1. Master Workplace / Availability Agent")
-    st.info("Upload matriks ketersediaan agen. Baris = Nama Agen, Kolom = Tanggal. Isi dengan 'IN' untuk agen yang siap dijadwalkan, atau biarkan kode cuti (CT, OR) sesuai persetujuan.")
+    st.info("Pastikan memiliki kolom 'Gender' (L/P) dan 'Kondisi' (Hamil/-) di sebelah Nama Agen.")
     upload_agent = st.file_uploader("📥 Upload Excel Workplace", type=['xlsx', 'csv'])
     
-    df_agent_display = st.session_state['agent_data'] if not st.session_state['agent_data'].empty else pd.DataFrame(columns=["Nama Agen", "2024-02-01", "2024-02-02"])
+    df_agent_display = st.session_state['agent_data'] if not st.session_state['agent_data'].empty else pd.DataFrame(columns=["Nama Agen", "Gender", "Kondisi", "2024-02-01", "2024-02-02"])
     
     if upload_agent:
         try:
@@ -307,7 +308,6 @@ elif menu == "🗄️ Database Agent & Target":
     
     st.divider()
     st.subheader("🧩 2. Target Komposisi Shift")
-    st.info("Upload hasil komposisi dari halaman Forecast Planner.")
     upload_comp = st.file_uploader("📥 Upload Target Komposisi", type=['xlsx', 'csv'])
     
     df_comp_display = st.session_state['shift_target'] if not st.session_state['shift_target'].empty else pd.DataFrame(columns=["Tanggal", "S1", "S2", "Total_Agent_Shift"])
@@ -328,11 +328,9 @@ elif menu == "🗄️ Database Agent & Target":
 # ==========================================
 elif menu == "🤖 Auto Rostering":
     st.header("🤖 Mesin Auto-Rostering Berbasis Ketersediaan & Keadilan")
-    st.markdown("Algoritma ini mendistribusikan shift operasional secara optimal. **Cuti (CT/SICK)** tidak memakan kuota OFF, dan jika ada kelebihan agen (melebihi target OFF), sisa agen otomatis dimasukkan ke shift **S3**.")
 
-    # --- SIDEBAR KHUSUS HALAMAN 3 ---
     st.sidebar.header("⚙️ Aturan Keadilan Jadwal")
-    target_off_or = st.sidebar.number_input("Target Jumlah OFF + OR / Bulan", min_value=4, max_value=15, value=10, help="CT (Cuti) tidak memotong target ini.")
+    target_off_or = st.sidebar.number_input("Target Jumlah OFF + OR / Bulan", min_value=4, max_value=15, value=10)
     target_consecutive = st.sidebar.slider("Target Double OFF/OR berdekatan", min_value=0, max_value=4, value=2)
     
     agent_df = st.session_state.get('agent_data', pd.DataFrame())
@@ -342,9 +340,16 @@ elif menu == "🤖 Auto Rostering":
         st.warning("⚠️ Data Workplace atau Target Komposisi belum lengkap.")
     else:
         name_col = next((c for c in agent_df.columns if 'nama' in str(c).lower()), agent_df.columns[0])
+        gender_col = next((c for c in agent_df.columns if 'gender' in str(c).lower() or 'kelamin' in str(c).lower()), None)
+        kondisi_col = next((c for c in agent_df.columns if 'kondisi' in str(c).lower() or 'hamil' in str(c).lower()), None)
+
+        if not gender_col:
+            st.warning("⚠️ Kolom 'Gender' (L/P) tidak ditemukan pada Master Workplace. Sistem mengasumsikan semua agen adalah Perempuan (P).")
+        if not kondisi_col:
+            st.warning("⚠️ Kolom 'Kondisi' (Hamil) tidak ditemukan pada Master Workplace. Filter agen hamil dinonaktifkan.")
+
         roster_df = agent_df.copy()
         
-        # Ekstrak data target komposisi harian di luar tombol agar kalkulator bisa membaca
         date_col_name = None
         for c in comp_df.columns:
             if str(c).strip().lower() in ['tanggal', 'date', 'waktu', 'hari', 'datetime', 'tgl']:
@@ -365,23 +370,8 @@ elif menu == "🤖 Auto Rostering":
                             if val > 0: reqs[str(col).strip()] = val
                         except: pass
                 daily_targets[date_str] = reqs
-        else:
-            shift_col_name = comp_df.columns[0]
-            for col in comp_df.columns[1:]:
-                if str(col).strip().lower() in ['total', 'total_agent_shift', 'unnamed']: continue
-                try:
-                    date_str = pd.to_datetime(str(col).strip().split(' ')[0]).strftime('%Y-%m-%d')
-                    reqs = {}
-                    for _, row in comp_df.iterrows():
-                        sc = str(row[shift_col_name]).strip()
-                        try:
-                            val = int(float(row[col]))
-                            if val > 0: reqs[sc] = val
-                        except: pass
-                    daily_targets[date_str] = reqs
-                except: pass
 
-        # --- PRE-CALCULATION (KALKULATOR KAPASITAS) ---
+        # --- PRE-CALCULATION ---
         total_required_shifts = sum(sum(reqs.values()) for reqs in daily_targets.values())
         total_days = len(daily_targets)
         total_capacity = 0
@@ -391,12 +381,11 @@ elif menu == "🤖 Auto Rostering":
             leave_count = 0
             or_count = 0
             for col in roster_df.columns:
-                if col == name_col: continue
+                if col in [name_col, gender_col, kondisi_col]: continue
                 val = str(roster_df.at[idx, col]).strip().upper()
                 if val in ['CT', 'CUTI', 'SICK', 'TRAINING']: leave_count += 1
                 elif val == 'OR': or_count += 1
                 
-            # Cuti (leave_count) tidak termasuk dalam target OFF+OR
             target_work = total_days - leave_count - target_off_or
             total_capacity += max(0, target_work)
             
@@ -412,19 +401,21 @@ elif menu == "🤖 Auto Rostering":
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Kebutuhan Shift (Bulan)", total_required_shifts)
         col2.metric("Total Kapasitas Agen (Kerja)", total_capacity)
-        
-        if gap > 0:
-            col3.metric("Selisih (Kelebihan Orang)", f"+{gap}", help="Kelebihan agen ini akan otomatis dialokasikan ke shift S3.")
-        elif gap < 0:
-            col3.metric("Selisih (Kekurangan Orang)", gap, help="Kekurangan ini menyebabkan beberapa agen terpaksa mendapat OFF kurang dari target.")
-        else:
-            col3.metric("Selisih", gap, help="Kapasitas seimbang sempurna!")
-        
+        col3.metric("Selisih Keseluruhan", gap)
         st.divider()
 
-        # --- EKSEKUSI AUTO ROSTER ---
-        if st.button("🚀 Jalankan Auto Roster", type="primary", use_container_width=True):
-            with st.spinner("Mengalokasikan shift dan memproses aturan spillover S3..."):
+        def get_allowed_genders(shift_code):
+            # Ekstrak angka dari S1, S6.3, S10, dll.
+            match = re.search(r'\d+(\.\d+)?', shift_code)
+            if not match: return ['P', 'L']
+            num = float(match.group())
+            allowed = []
+            if num <= 6.0: allowed.append('P')
+            if num >= 6.0: allowed.append('L')
+            return allowed
+
+        if st.button("🚀 Jalankan Auto Roster (Gender Aware)", type="primary", use_container_width=True):
+            with st.spinner("Mengalokasikan shift berdasar Gender dan Kondisi..."):
                 try:
                     agent_stats = {idx: {'worked': 0, 'off_or_count': agent_initial_stats[idx]['pre_or'], 'consecutive_count': 0, 'yesterday_status': None} for idx in roster_df.index}
                     sorted_dates = sorted(daily_targets.keys())
@@ -434,7 +425,7 @@ elif menu == "🤖 Auto Rostering":
                         
                         matching_col = None
                         for col in roster_df.columns:
-                            if col == name_col: continue
+                            if col in [name_col, gender_col, kondisi_col]: continue
                             try:
                                 if pd.to_datetime(str(col)).strftime('%Y-%m-%d') == target_date_str:
                                     matching_col = col
@@ -444,14 +435,26 @@ elif menu == "🤖 Auto Rostering":
                         if matching_col:
                             is_in_mask = roster_df[matching_col].astype(str).str.strip().str.upper() == 'IN'
                             available_indices = roster_df[is_in_mask].index.tolist()
+
+                            # 1. BYPASS AGEN HAMIL (Langsung ke S3)
+                            for idx in available_indices.copy():
+                                kondisi = str(roster_df.at[idx, kondisi_col]).strip().upper() if kondisi_col else ""
+                                if kondisi == 'HAMIL':
+                                    roster_df.at[idx, matching_col] = 'S3'
+                                    agent_stats[idx]['worked'] += 1
+                                    agent_stats[idx]['yesterday_status'] = 'WORK'
+                                    available_indices.remove(idx) # Keluarkan dari antrean reguler
+                                    
+                                    # Kurangi kuota S3 jika masih ada (bisa tembus minus)
+                                    if 'S3' in shift_reqs and shift_reqs['S3'] > 0:
+                                        shift_reqs['S3'] -= 1
                             
-                            # --- SCORING ALGORITHM ---
+                            # 2. SCORING UNTUK AGEN TERSISA
                             priority_scores = []
                             for idx in available_indices:
                                 stats = agent_stats[idx]
                                 score = agent_initial_stats[idx]['target_work'] - stats['worked']
                                 
-                                # Evaluasi Double OFF (hanya berlaku jika kemarin OFF/OR, bukan CT)
                                 if stats['yesterday_status'] in ['OFF', 'OR'] and stats['consecutive_count'] < target_consecutive:
                                     score -= 100 
                                 
@@ -461,37 +464,46 @@ elif menu == "🤖 Auto Rostering":
                             priority_scores.sort(key=lambda x: x[0], reverse=True)
                             sorted_available_indices = [x[1] for x in priority_scores]
                             
-                            # --- ALOKASI SHIFT UTAMA ---
-                            agent_idx = 0
+                            assigned_this_day = set()
+
+                            # 3. ALOKASI SHIFT SESUAI GENDER
                             for s_code, count in shift_reqs.items():
-                                for _ in range(count):
-                                    if agent_idx < len(sorted_available_indices):
-                                        target_row = sorted_available_indices[agent_idx]
+                                allowed_g = get_allowed_genders(s_code)
+                                assigned_count = 0
+                                
+                                for target_row in sorted_available_indices:
+                                    if assigned_count >= count: break
+                                    if target_row in assigned_this_day: continue
+                                    
+                                    gender = str(roster_df.at[target_row, gender_col]).strip().upper() if gender_col else 'P'
+                                    if gender not in ['P', 'L']: gender = 'P' # Default ke Perempuan jika kosong
+                                    
+                                    if gender in allowed_g:
                                         roster_df.at[target_row, matching_col] = s_code
-                                        
                                         agent_stats[target_row]['worked'] += 1
                                         agent_stats[target_row]['yesterday_status'] = 'WORK'
-                                        agent_idx += 1
+                                        assigned_this_day.add(target_row)
+                                        assigned_count += 1
                                         
-                            # --- ALOKASI SISA (SPILLOVER KE S3 ATAU JADIKAN OFF) ---
-                            for remaining_idx in range(agent_idx, len(sorted_available_indices)):
-                                target_row = sorted_available_indices[remaining_idx]
-                                
-                                # Jika agen sudah mencapai target kuota OFF/OR, berikan S3
-                                if agent_stats[target_row]['off_or_count'] >= target_off_or:
-                                    roster_df.at[target_row, matching_col] = 'S3'
-                                    agent_stats[target_row]['worked'] += 1
-                                    agent_stats[target_row]['yesterday_status'] = 'WORK'
-                                else:
-                                    # Jika agen belum mencapai target OFF
-                                    roster_df.at[target_row, matching_col] = 'OFF'
-                                    if agent_stats[target_row]['yesterday_status'] in ['OFF', 'OR']:
-                                        agent_stats[target_row]['consecutive_count'] += 1
+                            # 4. ALOKASI SISA (SPILLOVER ATAU OFF)
+                            for target_row in sorted_available_indices:
+                                if target_row not in assigned_this_day:
+                                    gender = str(roster_df.at[target_row, gender_col]).strip().upper() if gender_col else 'P'
                                     
-                                    agent_stats[target_row]['off_or_count'] += 1
-                                    agent_stats[target_row]['yesterday_status'] = 'OFF'
+                                    if agent_stats[target_row]['off_or_count'] >= target_off_or:
+                                        # Spillover Pintar: Perempuan = S3, Laki-laki = S6
+                                        spill_shift = 'S3' if gender == 'P' else 'S6'
+                                        roster_df.at[target_row, matching_col] = spill_shift
+                                        agent_stats[target_row]['worked'] += 1
+                                        agent_stats[target_row]['yesterday_status'] = 'WORK'
+                                    else:
+                                        roster_df.at[target_row, matching_col] = 'OFF'
+                                        if agent_stats[target_row]['yesterday_status'] in ['OFF', 'OR']:
+                                            agent_stats[target_row]['consecutive_count'] += 1
+                                        agent_stats[target_row]['off_or_count'] += 1
+                                        agent_stats[target_row]['yesterday_status'] = 'OFF'
                             
-                            # --- UPDATE STATUS UNTUK AGEN NON-IN (PRA-JADWAL) ---
+                            # 5. UPDATE STATUS NON-IN
                             not_in_mask = roster_df[matching_col].astype(str).str.strip().str.upper() != 'IN'
                             for idx in roster_df[not_in_mask].index:
                                 val = str(roster_df.at[idx, matching_col]).strip().upper()
@@ -500,7 +512,6 @@ elif menu == "🤖 Auto Rostering":
                                         agent_stats[idx]['consecutive_count'] += 1
                                     agent_stats[idx]['yesterday_status'] = val
                                 elif val in ['CT', 'CUTI', 'SICK', 'TRAINING']:
-                                    # Cuti tidak dihitung sebagai pembentuk Double OFF
                                     agent_stats[idx]['yesterday_status'] = 'CUTI'
                                 elif val.startswith('S') or val[0].isdigit():
                                     agent_stats[idx]['yesterday_status'] = 'WORK'
