@@ -288,7 +288,7 @@ elif menu == "🗄️ Database Agent & Target":
     st.info("Pastikan memiliki kolom 'Gender' (L/P) dan 'Kondisi' (Hamil/-) di sebelah Nama Agen.")
     upload_agent = st.file_uploader("📥 Upload Excel Workplace", type=['xlsx', 'csv'])
     
-    df_agent_display = st.session_state['agent_data'] if not st.session_state['agent_data'].empty else pd.DataFrame(columns=["Nama Agen", "Gender", "Kondisi", "2024-02-01", "2024-02-02"])
+    df_agent_display = st.session_state['agent_data'] if not st.session_state['agent_data'].empty else pd.DataFrame(columns=["Nama Agen", "Gender", "Kondisi", "2026-09-01", "2026-09-02"])
     
     if upload_agent:
         try:
@@ -298,7 +298,7 @@ elif menu == "🗄️ Database Agent & Target":
                 if isinstance(col, datetime.datetime):
                     new_cols.append(col.strftime('%Y-%m-%d'))
                 else:
-                    new_cols.append(col)
+                    new_cols.append(str(col))
             df_agent_display.columns = new_cols
         except Exception as e:
             st.error(f"Error membaca file workplace: {e}")
@@ -330,7 +330,7 @@ elif menu == "🤖 Auto Rostering":
     st.header("🤖 Mesin Auto-Rostering Berbasis Ketersediaan & Keadilan")
 
     st.sidebar.header("⚙️ Aturan Keadilan Jadwal")
-    target_off_or = st.sidebar.number_input("Target Jumlah OFF + OR / Bulan", min_value=4, max_value=15, value=10)
+    target_off_or = st.sidebar.number_input("Target Jumlah OFF + OR / Bulan (September)", min_value=4, max_value=15, value=10)
     target_consecutive = st.sidebar.slider("Target Double OFF/OR berdekatan", min_value=0, max_value=4, value=2)
     
     agent_df = st.session_state.get('agent_data', pd.DataFrame())
@@ -356,45 +356,70 @@ elif menu == "🤖 Auto Rostering":
             for _, row in comp_df.iterrows():
                 raw_date = str(row[date_col_name]).strip()
                 if raw_date.lower() in ['nat', 'nan', '']: continue
-                date_str = pd.to_datetime(raw_date.split(' ')[0]).strftime('%Y-%m-%d')
-                reqs = {}
-                for col in comp_df.columns:
-                    if col != date_col_name and str(col).strip().lower() not in ['total_agent_shift', 'total', 'unnamed: 0']:
-                        try:
-                            val = int(float(row[col]))
-                            if val > 0: reqs[str(col).strip()] = val
-                        except: pass
-                daily_targets[date_str] = reqs
+                try:
+                    date_str = pd.to_datetime(raw_date.split(' ')[0]).strftime('%Y-%m-%d')
+                    # Hanya ambil target bulan September (>= 2026-09-01)
+                    if date_str >= '2026-09-01':
+                        reqs = {}
+                        for col in comp_df.columns:
+                            if col != date_col_name and str(col).strip().lower() not in ['total_agent_shift', 'total', 'unnamed: 0']:
+                                try:
+                                    val = int(float(row[col]))
+                                    if val > 0: reqs[str(col).strip()] = val
+                                except: pass
+                        daily_targets[date_str] = reqs
+                except: pass
 
-        # --- PRE-CALCULATION ---
+        # --- INITIAL STATE READER (MENGANALISIS RIWAYAT AKHIR AGUSTUS) ---
+        september_dates = sorted([c for c in roster_df.columns if str(c).startswith('2026-09')])
+        august_dates = sorted([c for c in roster_df.columns if str(c).startswith('2026-08')])
+        
         total_required_shifts = sum(sum(reqs.values()) for reqs in daily_targets.values())
-        total_days = len(daily_targets)
+        total_days = len(september_dates) # Hanya menghitung hari di bulan September untuk target OFF
         total_capacity = 0
         agent_initial_stats = {}
         
         for idx in roster_df.index:
-            leave_count = 0
-            or_count = 0
-            for col in roster_df.columns:
-                if col in [name_col, gender_col, kondisi_col]: continue
+            # 1. Hitung jatah kerja bulan September murni
+            leave_count_sep = 0
+            or_count_sep = 0
+            for col in september_dates:
                 val = str(roster_df.at[idx, col]).strip().upper()
-                if val in ['CT', 'CUTI', 'SICK', 'TRAINING']: leave_count += 1
-                elif val == 'OR': or_count += 1
+                if val in ['CT', 'CUTI', 'SICK', 'TRAINING']: leave_count_sep += 1
+                elif val == 'OR': or_count_sep += 1
                 
-            target_work = total_days - leave_count - target_off_or
+            target_work = total_days - leave_count_sep - target_off_or
             total_capacity += max(0, target_work)
+            
+            # 2. Inisialisasi state awal dari riwayat Agustus (Initial State Reader)
+            last_shift_val = None
+            consecutive_work_aug = 0
+            
+            if august_dates:
+                # Cek mundur dari tanggal 31 Agustus ke belakang untuk status H-1 dan 5 HK
+                for aug_col in reversed(august_dates):
+                    val = str(roster_df.at[idx, aug_col]).strip().upper()
+                    if val.startswith('S') or val[0].isdigit():
+                        if last_shift_val is None:
+                            last_shift_val = val # Ambil shift terakhir yang dikerjakan di Agustus
+                        consecutive_work_aug += 1
+                    elif val in ['OFF', 'OR', 'CT', 'CUTI', 'SICK', 'TRAINING']:
+                        # Ketemu hari libur di akhir Agustus, putus hitungan beruntunnya
+                        break
             
             agent_initial_stats[idx] = {
                 'target_work': target_work,
-                'leave_count': leave_count,
-                'pre_or': or_count
+                'leave_count': leave_count_sep,
+                'pre_or': or_count_sep,
+                'initial_last_shift': last_shift_val,
+                'initial_consecutive_work': min(consecutive_work_aug, 5) # Maksimal cap di 5
             }
             
         gap = total_capacity - total_required_shifts
 
-        st.subheader("🧮 Kalkulator Kapasitas vs Kebutuhan")
+        st.subheader("🧮 Kalkulator Kapasitas vs Kebutuhan (Bulan September)")
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total Kebutuhan Shift (Bulan)", total_required_shifts)
+        col1.metric("Total Kebutuhan Shift (September)", total_required_shifts)
         col2.metric("Total Kapasitas Agen (Kerja)", total_capacity)
         col3.metric("Selisih Keseluruhan", gap)
         st.divider()
@@ -417,25 +442,27 @@ elif menu == "🤖 Auto Rostering":
             if last_shift and last_shift in DEFAULT_SHIFTS and shift_code in DEFAULT_SHIFTS:
                 t_last = pd.to_timedelta(DEFAULT_SHIFTS[last_shift])
                 t_curr = pd.to_timedelta(DEFAULT_SHIFTS[shift_code])
-                # Shift hari ini tidak boleh lebih awal dari (Shift kemarin - 1 Jam)
                 if t_curr < (t_last - pd.Timedelta(hours=1)):
                     return False
                     
             return True
 
-        if st.button("🚀 Jalankan Auto Roster (COPC & ICCA Standard)", type="primary", use_container_width=True):
-            with st.spinner("Menerapkan aturan rotasi maju & keadilan..."):
+        if st.button("🚀 Jalankan Auto Roster (September)", type="primary", use_container_width=True):
+            with st.spinner("Membaca riwayat Agustus & mengalokasikan shift September..."):
                 try:
-                    # Inisialisasi Tracker Stateful
-                    agent_stats = {idx: {
-                        'worked': 0, 
-                        'off_or_count': agent_initial_stats[idx]['pre_or'], 
-                        'consecutive_count': 0, 
-                        'yesterday_status': None,
-                        'consecutive_work': 0,
-                        'mandatory_off_remaining': 0,
-                        'last_shift': None # Shift H-1 untuk cek anti-jump
-                    } for idx in roster_df.index}
+                    # Inisialisasi Tracker Stateful dengan data awal dari Agustus
+                    agent_stats = {}
+                    for idx in roster_df.index:
+                        init_st = agent_initial_stats[idx]
+                        agent_stats[idx] = {
+                            'worked': 0, 
+                            'off_or_count': init_st['pre_or'], 
+                            'consecutive_count': 0, 
+                            'yesterday_status': 'WORK' if init_st['initial_last_shift'] else 'OFF',
+                            'consecutive_work': init_st['initial_consecutive_work'],
+                            'mandatory_off_remaining': 2 if init_st['initial_consecutive_work'] >= 5 else 0,
+                            'last_shift': init_st['initial_last_shift']
+                        }
                     
                     sorted_dates = sorted(daily_targets.keys())
 
@@ -455,15 +482,14 @@ elif menu == "🤖 Auto Rostering":
                             is_in_mask = roster_df[matching_col].astype(str).str.strip().str.upper() == 'IN'
                             available_indices = roster_df[is_in_mask].index.tolist()
 
-                            # 1. Pisahkan agen yang wajib OFF karena sudah kerja 5 HK
+                            # 1. Saring agen yang wajib OFF karena sudah 5 HK (termasuk carry-over dari Agustus)
                             eligible_for_work_indices = []
                             for idx in available_indices:
                                 if agent_stats[idx]['mandatory_off_remaining'] > 0:
-                                    # Agen ini wajib libur, lewati dari daftar kerja
                                     continue
                                 eligible_for_work_indices.append(idx)
 
-                            # 2. SCORING AGEN (Untuk yang boleh kerja)
+                            # 2. SCORING AGEN
                             priority_scores = []
                             for idx in eligible_for_work_indices:
                                 stats = agent_stats[idx]
@@ -498,14 +524,13 @@ elif menu == "🤖 Auto Rostering":
                                             agent_stats[target_row]['consecutive_work'] += 1
                                             agent_stats[target_row]['consecutive_count'] = 0
                                             
-                                            # Jika mencapai 5 HK berturut, wajibkan 2 hari OFF
                                             if agent_stats[target_row]['consecutive_work'] >= 5:
                                                 agent_stats[target_row]['mandatory_off_remaining'] = 2
                                                 
                                             assigned_this_day.add(target_row)
                                             break
 
-                            # 4. ALOKASI SISA AGEN (TERMASUK YANG MANDATORY OFF)
+                            # 4. ALOKASI SISA AGEN (SPILLOVER KERJA ATAU OFF)
                             for target_row in available_indices:
                                 if target_row not in assigned_this_day:
                                     gender = str(roster_df.at[target_row, gender_col]).strip().upper() if gender_col else 'P'
@@ -515,9 +540,7 @@ elif menu == "🤖 Auto Rostering":
                                     force_work_due_to_target = (agent_stats[target_row]['off_or_count'] >= target_off_or)
                                     is_mandatory_off = (agent_stats[target_row]['mandatory_off_remaining'] > 0)
                                     
-                                    # PRIORITAS: Mandatory OFF 5-2 mengalahkan target bulanan.
                                     if force_work_due_to_target and not is_mandatory_off:
-                                        # Cari fallback shift yang aman
                                         fallback_shift = None
                                         candidates = ['S3'] if is_hamil else (['S3', 'S4', 'S5', 'S6'] if gender == 'P' else ['S4', 'S5', 'S6', 'S10.3', 'S11'])
                                         for cand in candidates:
@@ -536,18 +559,19 @@ elif menu == "🤖 Auto Rostering":
                                         if agent_stats[target_row]['consecutive_work'] >= 5:
                                             agent_stats[target_row]['mandatory_off_remaining'] = 2
                                     else:
-                                        # Berikan OFF
                                         roster_df.at[target_row, matching_col] = 'OFF'
                                         if agent_stats[target_row]['yesterday_status'] in ['OFF', 'OR']:
                                             agent_stats[target_row]['consecutive_count'] += 1
                                         agent_stats[target_row]['off_or_count'] += 1
                                         agent_stats[target_row]['yesterday_status'] = 'OFF'
                                         agent_stats[target_row]['consecutive_work'] = 0
-                                        agent_stats[target_row]['last_shift'] = None # Reset siklus rotasi
+                                        agent_stats[target_row]['last_shift'] = None
                                         if agent_stats[target_row]['mandatory_off_remaining'] > 0:
                                             agent_stats[target_row]['mandatory_off_remaining'] -= 1
+                                        
+                                    assigned_this_day.add(target_row)
                             
-                            # 5. UPDATE STATUS UNTUK AGEN NON-IN (CUTI/OR)
+                            # 5. UPDATE STATUS NON-IN (CUTI/OR)
                             not_in_mask = roster_df[matching_col].astype(str).str.strip().str.upper() != 'IN'
                             for idx in roster_df[not_in_mask].index:
                                 val = str(roster_df.at[idx, matching_col]).strip().upper()
@@ -590,17 +614,17 @@ elif menu == "🤖 Auto Rostering":
                 elif val_str.startswith('S') or val_str[0].isdigit(): return 'background-color: #e6f2ff; color: #004085; font-weight: bold; text-align: center;'
                 return 'text-align: center;'
 
-            st.subheader("📋 Hasil Jadwal Roster Otomatis")
+            st.subheader("📋 Hasil Jadwal Roster Otomatis (September)")
             st.dataframe(df_roster.style.map(style_auto_roster), use_container_width=True, height=500)
             
             out_excel = io.BytesIO()
             with pd.ExcelWriter(out_excel, engine='xlsxwriter') as writer:
-                df_roster.to_excel(writer, sheet_name="Roster_Jadwal")
+                df_roster.to_excel(writer, sheet_name="Roster_September")
                 
             st.download_button(
                 label="📥 Download Jadwal Excel",
                 data=out_excel.getvalue(),
-                file_name="Fairness_Based_Roster.xlsx",
+                file_name="Fairness_Based_Roster_September.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary"
             )
