@@ -29,34 +29,41 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI ALOKASI SHIFT (PULP) - STRICT CONSTRAINT ---
+# --- FUNGSI ALOKASI SHIFT (PULP) ---
 @st.cache_data(show_spinner=False)
 def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_hours=9.0, target_mode='Base'):
+    import uuid
     shift_items = {}
     for s_code, s_time in master_shifts.items():
         shift_items[s_code] = pd.to_timedelta(str(s_time))
         
     results = []
-    
     df_process = df_result.copy()
     df_process['Datetime'] = pd.to_datetime(df_process['Datetime'])
     df_process['Date'] = pd.to_datetime(df_process['Date']).dt.date
-    
     unique_dates = df_process['Date'].unique()
     col_target = 'Base_Agent_Needed' if target_mode == 'Base' else 'Agent_Needed_Adjust'
     
+    # Generate Unique Run ID untuk mencegah memori bertabrakan di Streamlit
+    run_id = uuid.uuid4().hex[:6]
+    
     for d in unique_dates:
         df_day = df_process[df_process['Date'] == d].sort_values('Datetime').copy()
+        clean_d = str(d).replace("-", "_")
+        prob = pulp.LpProblem(f"Shift_Allocation_{clean_d}_{run_id}", pulp.LpMinimize)
         
-        prob = pulp.LpProblem(f"Shift_Allocation_{d}", pulp.LpMinimize)
-        
-        shift_vars = {s_code: pulp.LpVariable(f"{s_code}", lowBound=0, cat='Integer') for s_code in shift_items.keys()}
+        # Sanitasi nama variabel (Ganti titik dengan underscore & pasang ID unik)
+        shift_vars = {}
+        for s_code in shift_items.keys():
+            safe_s_code = str(s_code).replace(".", "_")
+            var_name = f"Shift_{safe_s_code}_{clean_d}_{run_id}"
+            shift_vars[s_code] = pulp.LpVariable(var_name, lowBound=0, cat=pulp.LpInteger)
+            
         surplus_vars = []
         
         for _, row in df_day.iterrows():
             dt = row['Datetime']
             req = row[col_target]
-            
             active_shifts_in_interval = []
             
             for s_code, s_start_td in shift_items.items():
@@ -69,20 +76,16 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
                     active_shifts_in_interval.append(shift_vars[s_code])
             
             interval_str = dt.strftime('%H%M')
-            surplus = pulp.LpVariable(f"Surplus_{interval_str}", lowBound=0)
+            surplus = pulp.LpVariable(f"Surplus_{interval_str}_{clean_d}_{run_id}", lowBound=0)
             surplus_vars.append(surplus)
             
-            # HARD CONSTRAINT: Agent yang duty - Surplus = Target
-            prob += pulp.lpSum(active_shifts_in_interval) - surplus == req, f"Req_{interval_str}"
+            prob += pulp.lpSum(active_shifts_in_interval) - surplus == req, f"Req_{interval_str}_{run_id}"
             
-        # FUNGSI OBJEKTIF: Minimalkan total agen, sambil meratakan surplus (bobot 0.01)
         prob += pulp.lpSum([shift_vars[s_code] for s_code in shift_items.keys()]) + 0.01 * pulp.lpSum(surplus_vars)
-        
         prob.solve(pulp.PULP_CBC_CMD(msg=0))
         
         row_res = {'Tanggal': d}
         total = 0
-        
         if pulp.LpStatus[prob.status] == 'Optimal':
             for s_code in shift_items.keys():
                 val = int(shift_vars[s_code].varValue) if shift_vars[s_code].varValue is not None else 0
@@ -91,7 +94,6 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
         else:
             for s_code in shift_items.keys():
                 row_res[s_code] = 0
-                
         row_res['Total_Agent_Shift'] = total
         results.append(row_res)
         
