@@ -6,13 +6,11 @@ import io
 import datetime
 import re
 import traceback
-import uuid
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import warnings
 import logging
 from functools import lru_cache
-import pulp
 
 # --- SUPPRESS WARNINGS & PROPHET LOGS ---
 warnings.filterwarnings('ignore')
@@ -37,78 +35,6 @@ DEFAULT_SHIFTS = {
     'S10': '15:00:00', 'S10.3': '15:30:00', 'S19': '19:00:00', 'S20': '20:00:00', 
     'S11': '21:00:00'
 }
-
-# --- FUNGSI ALOKASI SHIFT (PULP) TERBARU ---
-@st.cache_data(show_spinner=False)
-def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_hours=9.0, target_mode='Base'):
-    shift_items = {}
-    for s_code, s_time in master_shifts.items():
-        shift_items[s_code] = pd.to_timedelta(str(s_time))
-        
-    results = []
-    df_process = df_result.copy()
-    df_process['Datetime'] = pd.to_datetime(df_process['Datetime'])
-    df_process['Date'] = pd.to_datetime(df_process['Date']).dt.date
-    unique_dates = df_process['Date'].unique()
-    col_target = 'Base_Agent_Needed' if target_mode == 'Base' else 'Agent_Needed_Adjust'
-    
-    # Generate Unique Run ID untuk mencegah memori bertabrakan di Streamlit Cloud
-    run_id = str(uuid.uuid4().hex[:6])
-    
-    for d in unique_dates:
-        df_day = df_process[df_process['Date'] == d].sort_values('Datetime').copy()
-        clean_d = str(d).replace("-", "_")
-        prob = pulp.LpProblem(f"Shift_Allocation_{clean_d}_{run_id}", pulp.LpMinimize)
-        
-        # 1. Sanitasi nama variabel secara ekstrem agar aman di memori PuLP Linux
-        shift_vars = {}
-        for s_code in shift_items.keys():
-            safe_s_code = str(s_code).replace(".", "_").replace("-", "_").replace(" ", "_")
-            var_name = f"Shift_{safe_s_code}_{clean_d}_{run_id}"
-            
-            # FIX UTAMA: Pemanggilan explicit menggunakan string murni 'Integer'
-            shift_vars[s_code] = pulp.LpVariable(name=str(var_name), lowBound=0, cat='Integer')
-            
-        surplus_vars = []
-        
-        for _, row in df_day.iterrows():
-            dt = row['Datetime']
-            req = row[col_target]
-            active_shifts_in_interval = []
-            
-            for s_code, s_start_td in shift_items.items():
-                shift_start_dt = pd.to_datetime(str(d)) + s_start_td
-                shift_end_dt = shift_start_dt + pd.Timedelta(hours=float(shift_duration_hours))
-                
-                if shift_start_dt <= dt < shift_end_dt:
-                    active_shifts_in_interval.append(shift_vars[s_code])
-                elif (shift_start_dt - pd.Timedelta(days=1)) <= dt < (shift_end_dt - pd.Timedelta(days=1)):
-                    active_shifts_in_interval.append(shift_vars[s_code])
-            
-            interval_str = dt.strftime('%H%M')
-            var_surplus_name = f"Surplus_{interval_str}_{clean_d}_{run_id}"
-            surplus = pulp.LpVariable(name=str(var_surplus_name), lowBound=0)
-            surplus_vars.append(surplus)
-            
-            prob += pulp.lpSum(active_shifts_in_interval) - surplus == float(req), f"Req_{interval_str}_{run_id}"
-            
-        prob += pulp.lpSum([shift_vars[s_code] for s_code in shift_items.keys()]) + 0.01 * pulp.lpSum(surplus_vars)
-        prob.solve(pulp.PULP_CBC_CMD(msg=0))
-        
-        row_res = {'Tanggal': d}
-        total = 0
-        if pulp.LpStatus[prob.status] == 'Optimal':
-            for s_code in shift_items.keys():
-                val = int(shift_vars[s_code].varValue) if shift_vars[s_code].varValue is not None else 0
-                row_res[s_code] = val
-                total += val
-        else:
-            for s_code in shift_items.keys():
-                row_res[s_code] = 0
-        row_res['Total_Agent_Shift'] = total
-        results.append(row_res)
-        
-    return pd.DataFrame(results)
 
 # --- FUNGSI ERLANG & AI ---
 @lru_cache(maxsize=100000)
@@ -200,25 +126,19 @@ menu = st.sidebar.radio("Pilih Halaman:", ["📊 Forecast & Planner", "🗄️ D
 st.sidebar.divider()
 
 # ==========================================
-# HALAMAN 1: FORECAST & PLANNER
+# HALAMAN 1: FORECAST & PLANNER (TANPA PULP)
 # ==========================================
 if menu == "📊 Forecast & Planner":
     st.header("WFM Forecast & Capacity Planning")
     st.sidebar.header("📂 1. Upload Database")
     file_cof = st.sidebar.file_uploader("Upload Data COF", type=['csv', 'xlsx'])
     file_aht = st.sidebar.file_uploader("Upload Data AHT", type=['csv', 'xlsx'])
-    file_shift = st.sidebar.file_uploader("Upload Master Shift", type=['csv', 'xlsx'])
-    file_holidays = st.sidebar.file_uploader("Upload Data Libur", type=['csv', 'xlsx'])
+    file_holidays = st.sidebar.file_uploader("Upload Data Libur (Opsional)", type=['csv', 'xlsx'])
 
     st.sidebar.header("⚙️ 2. Konfigurasi")
-    opt_target = st.sidebar.radio("Strategi Optimasi:", ["Base (Kebutuhan Murni)", "Shrinkage (Ideal)"])
     target_sl = st.sidebar.slider("Target Service Level (%)", 50, 100, 90) / 100
     max_wait_time = st.sidebar.number_input("Target ASA (Detik)", value=20)
-    max_occupancy = st.sidebar.slider("Target Max Occupancy (%)", 50, 100, 85) / 100
     shrinkage = st.sidebar.number_input("Shrinkage (%)", 0.0, 100.0, 30.0) / 100
-    work_hours = st.sidebar.number_input("Jam Kerja per Hari (FTE)", 1.0, 24.0, 8.0, 0.5)
-    work_days = st.sidebar.number_input("Hari Kerja/Bulan", value=22)
-    shift_duration = st.sidebar.number_input("Durasi 1 Shift (Jam)", 1.0, 24.0, 9.0, 0.5)
 
     st.sidebar.header("📅 3. Tanggal")
     start_hist = st.sidebar.date_input("Mulai Data Historis", pd.to_datetime('2024-02-01'))
@@ -226,10 +146,9 @@ if menu == "📊 Forecast & Planner":
     start_forecast = st.sidebar.date_input("Mulai Forecast", pd.to_datetime('2026-06-01'))
     end_forecast = st.sidebar.date_input("Akhir Forecast", pd.to_datetime('2026-06-30'))
 
-    if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
+    if st.button("Jalankan Forecast & Kalkulasi Kebutuhan", type="primary"):
         if file_cof and file_aht:
-            active_shifts = DEFAULT_SHIFTS.copy()
-            with st.spinner("Memproses Data..."):
+            with st.spinner("Memproses AI Prophet & Erlang C..."):
                 def robust_wfm_parser(uploaded_file, col_target):
                     df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('csv') else pd.read_excel(uploaded_file)
                     if df[col_target].dtype == 'object': df[col_target] = df[col_target].astype(str).str.replace(',', '.').astype(float)
@@ -287,16 +206,17 @@ if menu == "📊 Forecast & Planner":
                 df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
                 df_result['Date'] = df_result['Datetime'].dt.date
                 
-                mode = 'Base' if 'Base' in opt_target else 'Adjusted'
-                df_shift_dist = optimize_shift_distribution_pulp(df_result, active_shifts, shift_duration, target_mode=mode)
+                # Susun ulang kolom agar lebih mudah dibaca
+                df_display = df_result[['Date', 'Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust']]
                 
-            st.success("🎉 Forecast Selesai!")
-            st.dataframe(df_shift_dist, use_container_width=True)
+            st.success("🎉 Forecast & Kalkulasi Kebutuhan Erlang C Selesai!")
+            st.info("Gunakan data kebutuhan per 30 menit ini untuk menyusun Target Komposisi Shift secara manual.")
+            st.dataframe(df_display, use_container_width=True)
             
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                df_shift_dist.to_excel(writer, sheet_name='Distribusi_Shift', index=False)
-            st.download_button("📥 Download Excel Forecast", output.getvalue(), "Forecast_Result.xlsx")
+                df_display.to_excel(writer, sheet_name='Kebutuhan_Agent_Interval', index=False)
+            st.download_button("📥 Download Excel Kebutuhan per Interval", output.getvalue(), "ErlangC_Requirement.xlsx")
 
 # ==========================================
 # HALAMAN 2: DATABASE AGENT & TARGET
@@ -327,10 +247,10 @@ elif menu == "🗄️ Database Agent & Target":
     st.session_state['agent_data'] = edited_agent
     
     st.divider()
-    st.subheader("🧩 2. Target Komposisi Shift")
+    st.subheader("🧩 2. Target Komposisi Shift (Manual Input)")
     upload_comp = st.file_uploader("📥 Upload Target Komposisi", type=['xlsx', 'csv'])
     
-    df_comp_display = st.session_state['shift_target'] if not st.session_state['shift_target'].empty else pd.DataFrame(columns=["Tanggal", "S1", "S2", "Total_Agent_Shift"])
+    df_comp_display = st.session_state['shift_target'] if not st.session_state['shift_target'].empty else pd.DataFrame(columns=["Tanggal", "S1", "S2", "S11"])
 
     if upload_comp:
         try:
