@@ -4,32 +4,23 @@ import numpy as np
 import math
 import io
 import datetime
-import re
-import traceback
-import uuid
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import warnings
 import logging
 from functools import lru_cache
-import pulp
+import pulp  # Library untuk Linear Programming
 
 # --- SUPPRESS WARNINGS & PROPHET LOGS ---
 warnings.filterwarnings('ignore')
 logging.getLogger('prophet').setLevel(logging.WARNING)
 logging.getLogger('cmdstanpy').disabled = True
 
-# --- INISIALISASI SESSION STATE ---
-if 'agent_data' not in st.session_state:
-    st.session_state['agent_data'] = pd.DataFrame()
-if 'shift_target' not in st.session_state:
-    st.session_state['shift_target'] = pd.DataFrame()
-
 # --- KONFIGURASI HALAMAN ---
-st.set_page_config(page_title="WFM & Capacity Planner", layout="wide")
-st.title("WFM Forecast, Capacity & Rostering System")
+st.set_page_config(page_title="WFM Forecast & Capacity Planner", layout="wide")
+st.title("WFM Forecast & Capacity Planning Tool")
 
-# --- FALLBACK KAMUS SHIFT 24 JAM ---
+# --- FALLBACK KAMUS SHIFT 24 JAM (DEFAULT) ---
 DEFAULT_SHIFTS = {
     'S1': '06:00:00', 'S2': '07:00:00', 'S2.3': '07:30:00', 'S3': '08:00:00', 
     'S3.3': '08:30:00', 'S4': '09:00:00', 'S5': '10:00:00', 'S6': '11:00:00', 
@@ -38,7 +29,7 @@ DEFAULT_SHIFTS = {
     'S11': '21:00:00'
 }
 
-# --- FUNGSI ALOKASI SHIFT (PULP) ---
+# --- FUNGSI ALOKASI SHIFT (PULP) - STRICT CONSTRAINT ---
 @st.cache_data(show_spinner=False)
 def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_hours=9.0, target_mode='Base'):
     shift_items = {}
@@ -46,34 +37,26 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
         shift_items[s_code] = pd.to_timedelta(str(s_time))
         
     results = []
+    
     df_process = df_result.copy()
     df_process['Datetime'] = pd.to_datetime(df_process['Datetime'])
     df_process['Date'] = pd.to_datetime(df_process['Date']).dt.date
+    
     unique_dates = df_process['Date'].unique()
     col_target = 'Base_Agent_Needed' if target_mode == 'Base' else 'Agent_Needed_Adjust'
-    
-    # 1. Generate Unique Run ID untuk mencegah memori bertabrakan di Streamlit
-    run_id = uuid.uuid4().hex[:6]
     
     for d in unique_dates:
         df_day = df_process[df_process['Date'] == d].sort_values('Datetime').copy()
         
-        # 2. Bersihkan nama problem dari karakter strip (-)
-        clean_d = str(d).replace("-", "_")
-        prob = pulp.LpProblem(f"Shift_Allocation_{clean_d}_{run_id}", pulp.LpMinimize)
+        prob = pulp.LpProblem(f"Shift_Allocation_{d}", pulp.LpMinimize)
         
-        # 3. Buat variabel shift dengan nama Unik & Aman (Ganti titik dengan underscore)
-        shift_vars = {}
-        for s_code in shift_items.keys():
-            safe_s_code = str(s_code).replace(".", "_")
-            var_name = f"Shift_{safe_s_code}_{clean_d}_{run_id}"
-            shift_vars[s_code] = pulp.LpVariable(var_name, lowBound=0, cat=pulp.LpInteger)
-            
+        shift_vars = {s_code: pulp.LpVariable(f"{s_code}", lowBound=0, cat='Integer') for s_code in shift_items.keys()}
         surplus_vars = []
         
         for _, row in df_day.iterrows():
             dt = row['Datetime']
             req = row[col_target]
+            
             active_shifts_in_interval = []
             
             for s_code, s_start_td in shift_items.items():
@@ -86,18 +69,20 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
                     active_shifts_in_interval.append(shift_vars[s_code])
             
             interval_str = dt.strftime('%H%M')
-            
-            var_surplus_name = f"Surplus_{interval_str}_{clean_d}_{run_id}"
-            surplus = pulp.LpVariable(var_surplus_name, lowBound=0)
+            surplus = pulp.LpVariable(f"Surplus_{interval_str}", lowBound=0)
             surplus_vars.append(surplus)
             
-            prob += pulp.lpSum(active_shifts_in_interval) - surplus == req, f"Req_{interval_str}_{run_id}"
+            # HARD CONSTRAINT: Agent yang duty - Surplus = Target
+            prob += pulp.lpSum(active_shifts_in_interval) - surplus == req, f"Req_{interval_str}"
             
+        # FUNGSI OBJEKTIF: Minimalkan total agen, sambil meratakan surplus (bobot 0.01)
         prob += pulp.lpSum([shift_vars[s_code] for s_code in shift_items.keys()]) + 0.01 * pulp.lpSum(surplus_vars)
+        
         prob.solve(pulp.PULP_CBC_CMD(msg=0))
         
         row_res = {'Tanggal': d}
         total = 0
+        
         if pulp.LpStatus[prob.status] == 'Optimal':
             for s_code in shift_items.keys():
                 val = int(shift_vars[s_code].varValue) if shift_vars[s_code].varValue is not None else 0
@@ -106,27 +91,35 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
         else:
             for s_code in shift_items.keys():
                 row_res[s_code] = 0
+                
         row_res['Total_Agent_Shift'] = total
         results.append(row_res)
         
     return pd.DataFrame(results)
 
-# --- FUNGSI ERLANG & AI ---
+# --- FUNGSI ERLANG C ITERATIF ---
 @lru_cache(maxsize=100000)
 def erlang_c_prob(agents, traffic_rounded):
-    if agents <= traffic_rounded: return 1.0
+    if agents <= traffic_rounded:
+        return 1.0
     erlang_b_inv = 1.0
-    for i in range(1, int(agents) + 1): erlang_b_inv = 1.0 + erlang_b_inv * i / traffic_rounded
+    for i in range(1, int(agents) + 1):
+        erlang_b_inv = 1.0 + erlang_b_inv * i / traffic_rounded
     erlang_b = 1.0 / erlang_b_inv
     erlang_c = erlang_b / (1.0 - (traffic_rounded / agents) * (1.0 - erlang_b))
     return max(0.0, min(1.0, erlang_c))
 
 def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time, interval_seconds=1800):
-    if pd.isna(cof) or pd.isna(aht_seconds) or cof <= 0: return 0, 0.0, 1.0
+    if pd.isna(cof) or pd.isna(aht_seconds) or cof <= 0:
+        return 0, 0.0, 1.0
+    
     traffic = (cof * aht_seconds) / interval_seconds
     traffic_rounded = round(traffic, 2)
+    
     agents = math.ceil(traffic)
-    if agents == 0: agents = 1
+    if agents == 0:
+        agents = 1
+    
     while True:
         prob_wait = erlang_c_prob(agents, traffic_rounded)
         if agents > traffic:
@@ -135,10 +128,14 @@ def calculate_agents_erlang(cof, aht_seconds, target_sl, max_wait_time, interval
         else:
             asa = float('inf')
             sl = 0.0
-        if sl >= target_sl: break
+            
+        if sl >= target_sl:
+            break
         agents += 1
+        
     return agents, asa, sl
 
+# --- FUNGSI CLEANSING HOLT-WINTERS ---
 @st.cache_data(show_spinner=False)
 def cleanse_data_hw(df, target_col, seasonal_periods=7, threshold=2.0, min_residual=15):
     series = df[target_col].ffill().bfill()
@@ -152,15 +149,20 @@ def cleanse_data_hw(df, target_col, seasonal_periods=7, threshold=2.0, min_resid
     cleansed_series[is_anomaly] = fitted_values[is_anomaly]
     return cleansed_series, is_anomaly
 
+# --- FUNGSI PROPHET UNTUK HARIAN ---
 @st.cache_data(show_spinner=False)
 def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fcst, use_auto_payday=True):
     df_prophet = pd.DataFrame({'ds': pd.to_datetime(df_hist_daily['Date']), 'y': df_hist_daily[target_col]})
+    
     holidays_list = []
     holiday_dates = []
     
     if df_holidays is not None and not df_holidays.empty:
         if 'Tanggal' in df_holidays.columns:
-            h_df = pd.DataFrame({'holiday': 'libur_nasional', 'ds': pd.to_datetime(df_holidays['Tanggal']), 'lower_window': 0, 'upper_window': 0})
+            h_df = pd.DataFrame({
+                'holiday': 'libur_nasional', 'ds': pd.to_datetime(df_holidays['Tanggal']),
+                'lower_window': 0, 'upper_window': 0
+            })
             holidays_list.append(h_df)
             holiday_dates = pd.to_datetime(df_holidays['Tanggal']).dt.normalize().tolist()
             
@@ -176,570 +178,261 @@ def run_prophet_daily(df_hist_daily, df_holidays, target_col, start_fcst, end_fc
         holidays_list.append(pd.DataFrame({'holiday': 'payday', 'ds': list(set(paydays)), 'lower_window': 0, 'upper_window': 0}))
         
     final_holidays = pd.concat(holidays_list, ignore_index=True) if holidays_list else None
+        
     try:
         model = Prophet(holidays=final_holidays, daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=True, seasonality_mode='multiplicative')
         model.fit(df_prophet)
+        
         last_hist_date = df_prophet['ds'].max()
         end_fcst_dt = pd.to_datetime(end_fcst)
         periods = (end_fcst_dt - last_hist_date).days if end_fcst_dt > last_hist_date else 0
+            
         future = model.make_future_dataframe(periods=periods, freq='D', include_history=False)
         forecast = model.predict(future)
+        
         start_fcst_dt = pd.to_datetime(start_fcst)
         future_forecast = forecast[(forecast['ds'] >= start_fcst_dt) & (forecast['ds'] <= end_fcst_dt)][['ds', 'yhat']]
         future_forecast.rename(columns={'ds': 'Date', 'yhat': f'{target_col}_daily_forecast'}, inplace=True)
+        
         future_forecast[f'{target_col}_daily_forecast'] = future_forecast[f'{target_col}_daily_forecast'].clip(lower=1)
         return future_forecast
     except Exception as e:
-        st.error(f"Gagal memproses AI Prophet: {e}")
+        st.error(f"Gagal memproses AI Prophet pada metrik {target_col}: {e}")
         return pd.DataFrame()
 
-# ==========================================
-# UI SIDEBAR UTAMA (NAVIGASI)
-# ==========================================
-st.sidebar.title("🧭 Navigasi Menu")
-menu = st.sidebar.radio("Pilih Halaman:", ["📊 Forecast & Planner", "🗄️ Database Agent & Target", "🤖 Auto Rostering"])
-st.sidebar.divider()
+# --- UI SIDEBAR ---
+st.sidebar.header("📂 1. Upload Database")
+file_cof = st.sidebar.file_uploader("Upload Data COF (Interval 30 Min)", type=['csv', 'xlsx'])
+file_aht = st.sidebar.file_uploader("Upload Data AHT (Interval 30 Min)", type=['csv', 'xlsx'])
+file_shift = st.sidebar.file_uploader("Upload Master Shift (Opsional)", type=['csv', 'xlsx'])
+file_holidays = st.sidebar.file_uploader("Upload Data Libur Nasional (Opsional)", type=['csv', 'xlsx'])
 
-# ==========================================
-# HALAMAN 1: FORECAST & PLANNER
-# ==========================================
-if menu == "📊 Forecast & Planner":
-    st.header("WFM Forecast & Capacity Planning")
-    st.sidebar.header("📂 1. Upload Database")
-    file_cof = st.sidebar.file_uploader("Upload Data COF", type=['csv', 'xlsx'])
-    file_aht = st.sidebar.file_uploader("Upload Data AHT", type=['csv', 'xlsx'])
-    file_shift = st.sidebar.file_uploader("Upload Master Shift", type=['csv', 'xlsx'])
-    file_holidays = st.sidebar.file_uploader("Upload Data Libur", type=['csv', 'xlsx'])
+st.sidebar.header("⚙️ 2. Konfigurasi Target Optimasi")
+opt_target = st.sidebar.radio(
+    "Strategi Pembuatan Jadwal Shift:",
+    ["Base (Kebutuhan Murni)", "Shrinkage (Kebutuhan Ideal)"],
+    help="Base: Menghasilkan jadwal lebih efisien. Shrinkage: Jadwal sangat aman namun butuh headcount tinggi."
+)
 
-    st.sidebar.header("⚙️ 2. Konfigurasi")
-    opt_target = st.sidebar.radio("Strategi Optimasi:", ["Base (Kebutuhan Murni)", "Shrinkage (Ideal)"])
-    target_sl = st.sidebar.slider("Target Service Level (%)", 50, 100, 90) / 100
-    max_wait_time = st.sidebar.number_input("Target ASA (Detik)", value=20)
-    max_occupancy = st.sidebar.slider("Target Max Occupancy (%)", 50, 100, 85) / 100
-    shrinkage = st.sidebar.number_input("Shrinkage (%)", 0.0, 100.0, 30.0) / 100
-    work_hours = st.sidebar.number_input("Jam Kerja per Hari (FTE)", 1.0, 24.0, 8.0, 0.5)
-    work_days = st.sidebar.number_input("Hari Kerja/Bulan", value=22)
-    shift_duration = st.sidebar.number_input("Durasi 1 Shift (Jam)", 1.0, 24.0, 9.0, 0.5)
+st.sidebar.header("⚙️ 3. Konfigurasi WFM")
+target_sl = st.sidebar.slider("Target Service Level (%)", min_value=50, max_value=100, value=90) / 100
+max_wait_time = st.sidebar.number_input("Target ASA (Detik)", value=20)
+max_occupancy = st.sidebar.slider("Target Max Occupancy (%)", min_value=50, max_value=100, value=85, help="Batas maksimal kesibukan agen.") / 100
+shrinkage = st.sidebar.number_input("Shrinkage (%)", min_value=0.0, max_value=100.0, value=30.0) / 100
 
-    st.sidebar.header("📅 3. Tanggal")
-    start_hist = st.sidebar.date_input("Mulai Data Historis", pd.to_datetime('2024-02-01'))
-    end_hist = st.sidebar.date_input("Akhir Data Historis", pd.to_datetime('2026-05-25'))
-    start_forecast = st.sidebar.date_input("Mulai Forecast", pd.to_datetime('2026-06-01'))
-    end_forecast = st.sidebar.date_input("Akhir Forecast", pd.to_datetime('2026-06-30'))
+# PERBAIKAN: Ubah menjadi desimal dengan step 0.5 untuk mengakomodir 30 menit
+work_hours = st.sidebar.number_input("Jam Kerja per Hari (FTE)", min_value=1.0, max_value=24.0, value=8.0, step=0.5, format="%.1f", help="Gunakan angka desimal. 7.5 = 7 jam 30 menit.")
+work_days = st.sidebar.number_input("Hari Kerja/Agen/Bulan", value=22)
+shift_duration = st.sidebar.number_input("Durasi 1 Shift (Jam)", min_value=1.0, max_value=24.0, value=9.0, step=0.5, format="%.1f", help="Gunakan angka desimal. 8.5 = 8 jam 30 menit.")
 
-    if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
-        if file_cof and file_aht:
-            active_shifts = DEFAULT_SHIFTS.copy()
-            with st.spinner("Memproses Data..."):
-                def robust_wfm_parser(uploaded_file, col_target):
-                    df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('csv') else pd.read_excel(uploaded_file)
-                    if df[col_target].dtype == 'object': df[col_target] = df[col_target].astype(str).str.replace(',', '.').astype(float)
-                    df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce', dayfirst=True)
-                    df = df.dropna(subset=['Datetime']) 
-                    df['Datetime'] = df['Datetime'].dt.round('30min')
-                    mask = (df['Datetime'] >= pd.to_datetime(start_hist)) & (df['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))
-                    df = df[mask].copy()
-                    df = df.groupby('Datetime')[col_target].first().reset_index()
-                    return df.set_index('Datetime').resample('30min').asfreq().fillna(0).reset_index()
+st.sidebar.header("📊 4. Profil Intraday")
+months_profile = st.sidebar.slider("Gunakan Profil Interval (Bulan Terakhir)", min_value=1, max_value=12, value=3)
 
-                df_cof = robust_wfm_parser(file_cof, 'COF')
-                df_aht = robust_wfm_parser(file_aht, 'AHT')
-                
-                df_cof_daily = df_cof.groupby(df_cof['Datetime'].dt.date)['COF'].sum().reset_index()
-                df_cof_daily.columns = ['Date', 'COF']
-                df_cof_daily['Date'] = pd.to_datetime(df_cof_daily['Date'])
-                df_cof_daily['COF_cleansed'], _ = cleanse_data_hw(df_cof_daily, 'COF')
-                
-                df_aht_daily = df_aht.replace(0, np.nan).groupby(df_aht['Datetime'].dt.date)['AHT'].mean().reset_index()
-                df_aht_daily.columns = ['Date', 'AHT']
-                df_aht_daily['Date'] = pd.to_datetime(df_aht_daily['Date'])
-                df_aht_daily['AHT'] = df_aht_daily['AHT'].ffill()
-                df_aht_daily['AHT_cleansed'], _ = cleanse_data_hw(df_aht_daily, 'AHT')
+st.sidebar.header("📅 5. Konfigurasi Tanggal")
+start_hist = st.sidebar.date_input("Mulai Data Historis", pd.to_datetime('2024-02-01'))
+end_hist = st.sidebar.date_input("Akhir Data Historis", pd.to_datetime('2026-05-25'))
+start_forecast = st.sidebar.date_input("Mulai Forecast", pd.to_datetime('2026-06-01'))
+end_forecast = st.sidebar.date_input("Akhir Forecast", pd.to_datetime('2026-06-30'))
 
-                fcst_cof = run_prophet_daily(df_cof_daily, None, 'COF_cleansed', start_forecast, end_forecast, True)
-                fcst_aht = run_prophet_daily(df_aht_daily, None, 'AHT_cleansed', start_forecast, end_forecast, True)
+use_payday = st.sidebar.checkbox("💰 Aktifkan Auto-Payday (Tgl 1 & 25)", value=True)
 
-                profile_start = df_cof['Datetime'].max() - pd.DateOffset(months=3)
-                df_recent = pd.merge(df_cof[df_cof['Datetime'] >= profile_start], df_aht[df_aht['Datetime'] >= profile_start], on='Datetime')
-                df_recent['Time'] = df_recent['Datetime'].dt.time
-                df_recent['Is_Weekend'] = df_recent['Datetime'].dt.weekday >= 5
-                df_recent['Date_Only'] = df_recent['Datetime'].dt.date
-                daily_totals = df_recent.groupby(['Date_Only', 'Is_Weekend'])['COF'].sum().reset_index(name='Tot_COF')
-                df_recent = pd.merge(df_recent, daily_totals, on=['Date_Only', 'Is_Weekend'])
-                df_recent['COF_Ratio'] = np.where(df_recent['Tot_COF'] > 0, df_recent['COF'] / df_recent['Tot_COF'], 0)
-                profile = df_recent.groupby(['Is_Weekend', 'Time']).agg(COF_Ratio=('COF_Ratio', 'mean')).reset_index()
-                profile['COF_Ratio'] = profile['COF_Ratio'] / profile.groupby('Is_Weekend')['COF_Ratio'].transform('sum')
-
-                recon_rows = []
-                for d in pd.date_range(start_forecast, end_forecast):
-                    d_date = d.date()
-                    is_wkd = d.weekday() >= 5
-                    c_val = fcst_cof[fcst_cof['Date'] == pd.to_datetime(d_date)]['COF_cleansed_daily_forecast'].values[0] if not fcst_cof[fcst_cof['Date'] == pd.to_datetime(d_date)].empty else 0
-                    a_val = fcst_aht[fcst_aht['Date'] == pd.to_datetime(d_date)]['AHT_cleansed_daily_forecast'].values[0] if not fcst_aht[fcst_aht['Date'] == pd.to_datetime(d_date)].empty else 100
-                    sub_p = profile[profile['Is_Weekend'] == is_wkd]
-                    for _, pr in sub_p.iterrows():
-                        recon_rows.append({'Datetime': pd.Timestamp.combine(d_date, pr['Time']), 'COF_forecast': c_val * pr['COF_Ratio'], 'AHT_forecast': a_val})
-                        
-                df_result = pd.DataFrame(recon_rows)
-                df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
-                
-                erlang_res = [calculate_agents_erlang(c, a, target_sl, max_wait_time) for c, a in zip(df_result['COF_forecast'], df_result['AHT_forecast'])]
-                df_result['Base_Agent_Needed'] = [r[0] for r in erlang_res]
-                df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
-                df_result['Date'] = df_result['Datetime'].dt.date
-                
-                mode = 'Base' if 'Base' in opt_target else 'Adjusted'
-                df_shift_dist = optimize_shift_distribution_pulp(df_result, active_shifts, shift_duration, target_mode=mode)
-                
-            st.success("🎉 Forecast Selesai!")
-            st.dataframe(df_shift_dist, use_container_width=True)
-            
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                df_shift_dist.to_excel(writer, sheet_name='Distribusi_Shift', index=False)
-            st.download_button("📥 Download Excel Forecast", output.getvalue(), "Forecast_Result.xlsx")
-
-# ==========================================
-# HALAMAN 2: DATABASE AGENT & TARGET
-# ==========================================
-elif menu == "🗄️ Database Agent & Target":
-    st.header("🗄️ Manajemen Database Agent & Target Komposisi")
-    
-    st.subheader("👥 1. Master Workplace / Availability Agent")
-    st.info("Pastikan memiliki kolom 'Gender' (L/P) dan 'Kondisi' (Hamil/-) di sebelah Nama Agen.")
-    upload_agent = st.file_uploader("📥 Upload Excel Workplace", type=['xlsx', 'csv'])
-    
-    df_agent_display = st.session_state['agent_data'] if not st.session_state['agent_data'].empty else pd.DataFrame(columns=["Nama Agen", "Gender", "Kondisi", "2026-09-01", "2026-09-02"])
-    
-    if upload_agent:
-        try:
-            df_agent_display = pd.read_excel(upload_agent) if upload_agent.name.endswith('xlsx') else pd.read_csv(upload_agent)
-            new_cols = []
-            for col in df_agent_display.columns:
-                if isinstance(col, datetime.datetime):
-                    new_cols.append(col.strftime('%Y-%m-%d'))
-                else:
-                    new_cols.append(str(col))
-            df_agent_display.columns = new_cols
-        except Exception as e:
-            st.error(f"Error membaca file workplace: {e}")
-
-    edited_agent = st.data_editor(df_agent_display, num_rows="dynamic", use_container_width=True, height=250)
-    st.session_state['agent_data'] = edited_agent
-    
-    st.divider()
-    st.subheader("🧩 2. Target Komposisi Shift")
-    upload_comp = st.file_uploader("📥 Upload Target Komposisi", type=['xlsx', 'csv'])
-    
-    df_comp_display = st.session_state['shift_target'] if not st.session_state['shift_target'].empty else pd.DataFrame(columns=["Tanggal", "S1", "S2", "Total_Agent_Shift"])
-
-    if upload_comp:
-        try:
-            xls = pd.ExcelFile(upload_comp)
-            df_comp_display = pd.read_excel(upload_comp, sheet_name='Distribusi_Shift') if 'Distribusi_Shift' in xls.sheet_names else pd.read_excel(upload_comp)
-            if 'Tanggal' in df_comp_display.columns: df_comp_display['Tanggal'] = pd.to_datetime(df_comp_display['Tanggal']).dt.strftime('%Y-%m-%d')
-        except:
-            df_comp_display = pd.read_csv(upload_comp)
-
-    edited_comp = st.data_editor(df_comp_display, num_rows="dynamic", use_container_width=True, height=250)
-    st.session_state['shift_target'] = edited_comp
-
-# ==========================================
-# HALAMAN 3: AUTO ROSTERING MACHINE
-# ==========================================
-elif menu == "🤖 Auto Rostering":
-    st.header("🤖 Mesin Auto-Rostering Berbasis Ketersediaan & Keadilan")
-
-    st.sidebar.header("⚙️ Aturan Keadilan Jadwal")
-    target_off_or = st.sidebar.number_input("Target Jumlah OFF + OR / Bulan (Bulan Target)", min_value=4, max_value=15, value=10)
-    target_consecutive = st.sidebar.slider("Target Double OFF/OR berdekatan", min_value=0, max_value=4, value=2)
-    
-    agent_df = st.session_state.get('agent_data', pd.DataFrame())
-    comp_df = st.session_state.get('shift_target', pd.DataFrame())
-
-    if agent_df.empty or comp_df.empty:
-        st.warning("⚠️ Data Workplace atau Target Komposisi belum lengkap.")
-    else:
-        name_col = next((c for c in agent_df.columns if 'nama' in str(c).lower()), agent_df.columns[0])
-        gender_col = next((c for c in agent_df.columns if 'gender' in str(c).lower() or 'kelamin' in str(c).lower()), None)
-        kondisi_col = next((c for c in agent_df.columns if 'kondisi' in str(c).lower() or 'hamil' in str(c).lower()), None)
-
-        roster_df = agent_df.copy()
+# --- PROSES UTAMA ---
+if st.button("Jalankan Forecast & Kalkulasi", type="primary"):
+    if file_cof and file_aht:
         
-        date_col_name = None
-        for c in comp_df.columns:
-            if str(c).strip().lower() in ['tanggal', 'date', 'waktu', 'hari', 'datetime', 'tgl']:
-                date_col_name = c
-                break
-        
-        daily_targets = {}
-        if date_col_name:
-            for _, row in comp_df.iterrows():
-                raw_date = str(row[date_col_name]).strip()
-                if raw_date.lower() in ['nat', 'nan', '']: continue
-                try:
-                    date_obj = pd.to_datetime(raw_date.split(' ')[0])
-                    date_str = date_obj.strftime('%Y-%m-%d')
-                    
-                    reqs = {}
-                    for col in comp_df.columns:
-                        if col != date_col_name and str(col).strip().lower() not in ['total_agent_shift', 'total', 'unnamed: 0']:
-                            try:
-                                val = int(float(row[col]))
-                                if val > 0: reqs[str(col).strip()] = val
-                            except: pass
-                    
-                    if reqs:
-                        daily_targets[date_str] = reqs
-                except: pass
-
-        # --- DYNAMIC DATE AUTO-DETECTOR ---
-        date_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}$')
-        all_date_cols = [str(c).strip() for c in roster_df.columns if date_pattern.match(str(c).strip())]
-        all_date_cols.sort()
-        
-        if daily_targets:
-            start_target_date = min(daily_targets.keys())
-        else:
-            start_target_date = "2099-12-31" 
-            
-        target_dates = [c for c in all_date_cols if c >= start_target_date]
-        buffer_dates = [c for c in all_date_cols if c < start_target_date]
-        
-        if start_target_date != "2099-12-31":
-            target_month_name = pd.to_datetime(start_target_date).strftime('%B %Y')
-        else:
-            target_month_name = "Bulan Berjalan"
-        
-        total_required_shifts = sum(sum(reqs.values()) for reqs in daily_targets.values())
-        total_days = len(target_dates)
-        total_capacity = 0
-        agent_initial_stats = {}
-        
-        for idx in roster_df.index:
-            leave_count_target = 0
-            or_count_target = 0
-            for col in target_dates:
-                val = str(roster_df.at[idx, col]).strip().upper()
-                if val in ['CT', 'CUTI', 'SICK', 'TRAINING']: leave_count_target += 1
-                elif val == 'OR': or_count_target += 1
+        active_shifts = DEFAULT_SHIFTS.copy()
+        if file_shift is not None:
+            try:
+                df_s = pd.read_csv(file_shift) if file_shift.name.endswith('csv') else pd.read_excel(file_shift)
+                if 'Kode_Shift' in df_s.columns and 'Waktu_Mulai' in df_s.columns:
+                    df_s['Waktu_Mulai'] = df_s['Waktu_Mulai'].astype(str)
+                    active_shifts = dict(zip(df_s['Kode_Shift'], df_s['Waktu_Mulai']))
+                    st.toast("✅ Master Shift kustom berhasil dimuat!", icon="🧩")
+            except Exception as e:
+                st.warning(f"Gagal membaca file Shift. Error: {e}")
                 
-            target_work = total_days - leave_count_target - target_off_or
-            total_capacity += max(0, target_work)
-            
-            # --- BUFFER PARSING ---
-            last_shift_val = None
-            consecutive_work_buffer = 0
-            s11_count_buffer = 0
-            s11_chain_active = True 
-            
-            if buffer_dates:
-                for buf_col in reversed(buffer_dates):
-                    val = str(roster_df.at[idx, buf_col]).strip().upper()
-                    if val.startswith('S') or val[0].isdigit():
-                        if last_shift_val is None:
-                            last_shift_val = val
-                        consecutive_work_buffer += 1
-                        
-                        if val == 'S11' and s11_chain_active:
-                            s11_count_buffer += 1
-                        else:
-                            s11_chain_active = False 
-                    elif val in ['OFF', 'OR', 'CT', 'CUTI', 'SICK', 'TRAINING']:
-                        break
-            
-            agent_initial_stats[idx] = {
-                'target_work': target_work,
-                'leave_count': leave_count_target,
-                'pre_or': or_count_target,
-                'initial_last_shift': last_shift_val,
-                'initial_consecutive_work': min(consecutive_work_buffer, 5),
-                'initial_s11_count': min(s11_count_buffer, 3) 
-            }
-            
-        gap = total_capacity - total_required_shifts
-
-        st.subheader(f"🧮 Kalkulator Kapasitas vs Kebutuhan ({target_month_name})")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Kebutuhan Shift", total_required_shifts)
-        col2.metric("Total Kapasitas Agen", total_capacity)
-        col3.metric("Selisih Keseluruhan", gap)
-        st.divider()
-
-        def is_agent_eligible(shift_code, gender, kondisi, last_shift, tomorrow_status='', s11_count=0):
-            is_hamil = str(kondisi).strip().upper() == 'HAMIL'
-            gender = str(gender).strip().upper()
-            if gender not in ['P', 'L']: gender = 'P'
-
-            if is_hamil:
-                if shift_code not in ['S1', 'S2', 'S2.3', 'S3']: return False
-            else:
-                match = re.search(r'\d+(\.\d+)?', shift_code)
-                num = float(match.group()) if match else 0
-                if gender == 'P' and num > 6.0: return False
-                if gender == 'L' and num < 4.0: return False
+        with st.spinner("Memvalidasi, Membaca, & Pre-processing Data Historis..."):
+            def robust_wfm_parser(uploaded_file, col_target):
+                df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('csv') else pd.read_excel(uploaded_file)
+                if df[col_target].dtype == 'object':
+                    df[col_target] = df[col_target].astype(str).str.replace(',', '.').astype(float)
                 
-            if tomorrow_status in ['CT', 'CUTI', 'SICK', 'TRAINING']:
-                if shift_code in ['S19', 'S20', 'S11']:
-                    return False
-                    
-            if shift_code == 'S11' and s11_count >= 3:
-                return False
+                df['Datetime'] = pd.to_datetime(df['Datetime'], errors='coerce', dayfirst=True)
+                df = df.dropna(subset=['Datetime']) 
                 
-            if last_shift and last_shift in DEFAULT_SHIFTS and shift_code in DEFAULT_SHIFTS:
-                t_last = pd.to_timedelta(DEFAULT_SHIFTS[last_shift])
-                t_curr = pd.to_timedelta(DEFAULT_SHIFTS[shift_code])
-                if t_curr < (t_last - pd.Timedelta(hours=1)):
-                    return False
-                    
-            return True
-
-        if st.button(f"🚀 Jalankan Auto Roster ({target_month_name})", type="primary", use_container_width=True):
-            with st.spinner("Menyeimbangkan Keadilan S11 & memproses jadwal..."):
-                try:
-                    agent_stats = {}
-                    for idx in roster_df.index:
-                        init_st = agent_initial_stats[idx]
-                        
-                        mand_off = 0
-                        if init_st['initial_consecutive_work'] >= 5 or init_st['initial_s11_count'] >= 3:
-                            mand_off = 2
-                            
-                        agent_stats[idx] = {
-                            'worked': 0, 
-                            'off_or_count': init_st['pre_or'], 
-                            'consecutive_count': 0, 
-                            'yesterday_status': 'WORK' if init_st['initial_last_shift'] else 'OFF',
-                            'consecutive_work': init_st['initial_consecutive_work'],
-                            's11_consecutive_count': init_st['initial_s11_count'],
-                            's11_total_count': 0, # NEW: Tracker total S11 sebulan untuk equity
-                            'mandatory_off_remaining': mand_off,
-                            'last_shift': init_st['initial_last_shift']
-                        }
-                    
-                    sorted_dates = sorted(daily_targets.keys())
-
-                    for target_date_str in sorted_dates:
-                        shift_reqs = daily_targets.get(target_date_str, {})
-                        
-                        matching_col = None
-                        for col in roster_df.columns:
-                            if col in [name_col, gender_col, kondisi_col]: continue
-                            try:
-                                if pd.to_datetime(str(col)).strftime('%Y-%m-%d') == target_date_str:
-                                    matching_col = col
-                                    break
-                            except: pass
-                            
-                        tomorrow_date_str = (pd.to_datetime(target_date_str) + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
-                        tomorrow_col = None
-                        for col in roster_df.columns:
-                            if col in [name_col, gender_col, kondisi_col]: continue
-                            try:
-                                if pd.to_datetime(str(col)).strftime('%Y-%m-%d') == tomorrow_date_str:
-                                    tomorrow_col = col
-                                    break
-                            except: pass
-                            
-                        if matching_col:
-                            is_in_mask = roster_df[matching_col].astype(str).str.strip().str.upper() == 'IN'
-                            available_indices = roster_df[is_in_mask].index.tolist()
-
-                            eligible_for_work_indices = []
-                            for idx in available_indices:
-                                if agent_stats[idx]['mandatory_off_remaining'] > 0:
-                                    continue
-                                eligible_for_work_indices.append(idx)
-
-                            # SCORING REGULER (Berdasarkan jumlah kebutuhan hari kerja)
-                            priority_scores = []
-                            for idx in eligible_for_work_indices:
-                                stats = agent_stats[idx]
-                                score = agent_initial_stats[idx]['target_work'] - stats['worked']
-                                
-                                if stats['yesterday_status'] in ['OFF', 'OR'] and stats['consecutive_count'] < target_consecutive:
-                                    score -= 100 
-                                
-                                score += np.random.uniform(-0.5, 0.5)
-                                priority_scores.append((score, idx))
-                            
-                            priority_scores.sort(key=lambda x: x[0], reverse=True)
-                            base_sorted_available_indices = [x[1] for x in priority_scores]
-                            
-                            assigned_this_day = set()
-
-                            # ALOKASI SHIFT
-                            for s_code, count in shift_reqs.items():
-                                
-                                # === EQUITY SORTER: S11 LOAD BALANCING ===
-                                if s_code == 'S11':
-                                    # Tarik agen dengan S11 Total paling sedikit ke antrean terdepan
-                                    sorted_available_indices = sorted(
-                                        base_sorted_available_indices,
-                                        key=lambda idx: (agent_stats[idx]['s11_total_count'], np.random.uniform())
-                                    )
-                                else:
-                                    sorted_available_indices = base_sorted_available_indices
-                                # =========================================
-
-                                for _ in range(count):
-                                    for target_row in sorted_available_indices:
-                                        if target_row in assigned_this_day: continue
-                                        
-                                        gender = roster_df.at[target_row, gender_col] if gender_col else 'P'
-                                        kondisi = roster_df.at[target_row, kondisi_col] if kondisi_col else ''
-                                        last_s = agent_stats[target_row]['last_shift']
-                                        s11_tracker = agent_stats[target_row]['s11_consecutive_count']
-                                        
-                                        tomorrow_status = ''
-                                        if tomorrow_col:
-                                            tomorrow_status = str(roster_df.at[target_row, tomorrow_col]).strip().upper()
-                                        
-                                        if is_agent_eligible(s_code, gender, kondisi, last_s, tomorrow_status, s11_tracker):
-                                            roster_df.at[target_row, matching_col] = s_code
-                                            agent_stats[target_row]['worked'] += 1
-                                            agent_stats[target_row]['yesterday_status'] = 'WORK'
-                                            agent_stats[target_row]['last_shift'] = s_code
-                                            agent_stats[target_row]['consecutive_work'] += 1
-                                            agent_stats[target_row]['consecutive_count'] = 0
-                                            
-                                            # Update S11 Trackers
-                                            if s_code == 'S11':
-                                                agent_stats[target_row]['s11_consecutive_count'] += 1
-                                                agent_stats[target_row]['s11_total_count'] += 1 
-                                            else:
-                                                agent_stats[target_row]['s11_consecutive_count'] = 0
-                                            
-                                            if agent_stats[target_row]['s11_consecutive_count'] >= 3:
-                                                agent_stats[target_row]['mandatory_off_remaining'] = max(agent_stats[target_row]['mandatory_off_remaining'], 2)
-                                            elif agent_stats[target_row]['consecutive_work'] >= 5:
-                                                agent_stats[target_row]['mandatory_off_remaining'] = max(agent_stats[target_row]['mandatory_off_remaining'], 2)
-                                                
-                                            assigned_this_day.add(target_row)
-                                            break
-
-                            # ALOKASI SISA AGEN (SPILLOVER KERJA ATAU OFF)
-                            for target_row in available_indices:
-                                if target_row not in assigned_this_day:
-                                    gender = str(roster_df.at[target_row, gender_col]).strip().upper() if gender_col else 'P'
-                                    kondisi = str(roster_df.at[target_row, kondisi_col]).strip().upper() if kondisi_col else ''
-                                    is_hamil = (kondisi == 'HAMIL')
-                                    
-                                    tomorrow_status = ''
-                                    if tomorrow_col:
-                                        tomorrow_status = str(roster_df.at[target_row, tomorrow_col]).strip().upper()
-                                    
-                                    force_work_due_to_target = (agent_stats[target_row]['off_or_count'] >= target_off_or)
-                                    is_mandatory_off = (agent_stats[target_row]['mandatory_off_remaining'] > 0)
-                                    
-                                    if force_work_due_to_target and not is_mandatory_off:
-                                        fallback_shift = None
-                                        candidates = ['S3'] if is_hamil else (['S3', 'S4', 'S5', 'S6'] if gender == 'P' else ['S4', 'S5', 'S6', 'S10.3', 'S11'])
-                                        for cand in candidates:
-                                            if is_agent_eligible(cand, gender, kondisi, agent_stats[target_row]['last_shift'], tomorrow_status, agent_stats[target_row]['s11_consecutive_count']):
-                                                fallback_shift = cand
-                                                break
-                                        
-                                        if not fallback_shift:
-                                            fallback_shift = 'S3' if gender == 'P' else 'S6'
-                                            
-                                        roster_df.at[target_row, matching_col] = fallback_shift
-                                        agent_stats[target_row]['worked'] += 1
-                                        agent_stats[target_row]['yesterday_status'] = 'WORK'
-                                        agent_stats[target_row]['last_shift'] = fallback_shift
-                                        agent_stats[target_row]['consecutive_work'] += 1
-                                        agent_stats[target_row]['consecutive_count'] = 0
-                                        
-                                        if fallback_shift == 'S11':
-                                            agent_stats[target_row]['s11_consecutive_count'] += 1
-                                            agent_stats[target_row]['s11_total_count'] += 1
-                                        else:
-                                            agent_stats[target_row]['s11_consecutive_count'] = 0
-                                            
-                                        if agent_stats[target_row]['s11_consecutive_count'] >= 3:
-                                            agent_stats[target_row]['mandatory_off_remaining'] = max(agent_stats[target_row]['mandatory_off_remaining'], 2)
-                                        elif agent_stats[target_row]['consecutive_work'] >= 5:
-                                            agent_stats[target_row]['mandatory_off_remaining'] = max(agent_stats[target_row]['mandatory_off_remaining'], 2)
-                                    else:
-                                        roster_df.at[target_row, matching_col] = 'OFF'
-                                        if agent_stats[target_row]['yesterday_status'] in ['OFF', 'OR']:
-                                            agent_stats[target_row]['consecutive_count'] += 1
-                                        agent_stats[target_row]['off_or_count'] += 1
-                                        agent_stats[target_row]['yesterday_status'] = 'OFF'
-                                        agent_stats[target_row]['consecutive_work'] = 0
-                                        agent_stats[target_row]['s11_consecutive_count'] = 0
-                                        agent_stats[target_row]['last_shift'] = None
-                                        if agent_stats[target_row]['mandatory_off_remaining'] > 0:
-                                            agent_stats[target_row]['mandatory_off_remaining'] -= 1
-                                        
-                                    assigned_this_day.add(target_row)
-                            
-                            # UPDATE STATUS NON-IN (CUTI/OR)
-                            not_in_mask = roster_df[matching_col].astype(str).str.strip().str.upper() != 'IN'
-                            for idx in roster_df[not_in_mask].index:
-                                val = str(roster_df.at[idx, matching_col]).strip().upper()
-                                if val in ['OFF', 'OR']:
-                                    if agent_stats[idx]['yesterday_status'] in ['OFF', 'OR']:
-                                        agent_stats[idx]['consecutive_count'] += 1
-                                    agent_stats[idx]['yesterday_status'] = val
-                                    agent_stats[idx]['consecutive_work'] = 0
-                                    agent_stats[idx]['s11_consecutive_count'] = 0
-                                    agent_stats[idx]['last_shift'] = None
-                                    if agent_stats[idx]['mandatory_off_remaining'] > 0:
-                                        agent_stats[idx]['mandatory_off_remaining'] -= 1
-                                elif val in ['CT', 'CUTI', 'SICK', 'TRAINING']:
-                                    agent_stats[idx]['yesterday_status'] = 'CUTI'
-                                    agent_stats[idx]['consecutive_work'] = 0
-                                    agent_stats[idx]['s11_consecutive_count'] = 0
-                                    agent_stats[idx]['last_shift'] = None
-                                    if agent_stats[idx]['mandatory_off_remaining'] > 0:
-                                        agent_stats[idx]['mandatory_off_remaining'] -= 1
-                                elif val.startswith('S') or val[0].isdigit():
-                                    agent_stats[idx]['yesterday_status'] = 'WORK'
-                                    agent_stats[idx]['last_shift'] = val
-                                    agent_stats[idx]['consecutive_work'] += 1
-                                    
-                                    if val == 'S11':
-                                        agent_stats[idx]['s11_consecutive_count'] += 1
-                                        agent_stats[idx]['s11_total_count'] += 1
-                                    else:
-                                        agent_stats[idx]['s11_consecutive_count'] = 0
-                                        
-                                    if agent_stats[idx]['s11_consecutive_count'] >= 3:
-                                        agent_stats[idx]['mandatory_off_remaining'] = max(agent_stats[idx]['mandatory_off_remaining'], 2)
-                                    elif agent_stats[idx]['consecutive_work'] >= 5:
-                                        agent_stats[idx]['mandatory_off_remaining'] = max(agent_stats[idx]['mandatory_off_remaining'], 2)
-
-                    final_roster = roster_df.set_index(name_col)
-                    st.session_state['final_roster'] = final_roster
-                    
-                except Exception as e:
-                    error_details = traceback.format_exc()
-                    st.error(f"Terjadi kesalahan saat memproses data:\n{e}\n\nDetail Sistem:\n{error_details}")
-
-        if 'final_roster' in st.session_state:
-            df_roster = st.session_state['final_roster']
-            
-            def style_auto_roster(val):
-                if pd.isna(val) or str(val).strip() == '': return ''
-                val_str = str(val).strip().upper()
-                if val_str == 'OFF': return 'background-color: #ffcccc; color: #cc0000; font-weight: bold; text-align: center;'
-                elif val_str in ['CUTI', 'CT', 'OR', 'SICK', 'TRAINING']: return 'background-color: #ffe5b4; color: #cc7700; text-align: center;'
-                elif val_str == 'IN': return 'background-color: #e6ffe6; color: #006600; text-align: center;'
-                elif val_str.startswith('S') or val[0].isdigit(): return 'background-color: #e6f2ff; color: #004085; font-weight: bold; text-align: center;'
-                return 'text-align: center;'
-
-            st.subheader(f"📋 Hasil Jadwal Roster Otomatis ({target_month_name})")
-            st.dataframe(df_roster.style.map(style_auto_roster), use_container_width=True, height=500)
-            
-            out_excel = io.BytesIO()
-            with pd.ExcelWriter(out_excel, engine='xlsxwriter') as writer:
-                df_roster.to_excel(writer, sheet_name=f"Roster_{target_month_name}")
+                df['Datetime'] = df['Datetime'].dt.round('30min')
                 
-            st.download_button(
-                label="📥 Download Jadwal Excel",
-                data=out_excel.getvalue(),
-                file_name=f"Fairness_Based_Roster_{target_month_name.replace(' ', '_')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary"
+                mask = (df['Datetime'] >= pd.to_datetime(start_hist)) & (df['Datetime'] <= pd.to_datetime(end_hist) + pd.Timedelta(days=1, seconds=-1))
+                df = df[mask].copy()
+                
+                df = df.groupby('Datetime')[col_target].first().reset_index()
+                return df.set_index('Datetime').resample('30min').asfreq().fillna(0).reset_index()
+
+            df_cof = robust_wfm_parser(file_cof, 'COF')
+            df_aht = robust_wfm_parser(file_aht, 'AHT')
+            
+            df_holidays = None
+            if file_holidays is not None:
+                df_holidays = pd.read_csv(file_holidays) if file_holidays.name.endswith('csv') else pd.read_excel(file_holidays)
+
+        with st.spinner("Melatih Model AI & Menerapkan Intraday Profiling..."):
+            df_cof_daily_raw = df_cof.groupby(df_cof['Datetime'].dt.date)['COF'].sum().reset_index()
+            df_cof_daily_raw.columns = ['Date', 'COF']
+            df_cof_daily_raw['Date'] = pd.to_datetime(df_cof_daily_raw['Date'])
+            df_cof_daily_raw['COF_cleansed'], _ = cleanse_data_hw(df_cof_daily_raw, 'COF', seasonal_periods=7, min_residual=15)
+            
+            df_aht_daily_raw = df_aht.replace(0, np.nan).groupby(df_aht['Datetime'].dt.date)['AHT'].mean().reset_index()
+            df_aht_daily_raw.columns = ['Date', 'AHT']
+            df_aht_daily_raw['Date'] = pd.to_datetime(df_aht_daily_raw['Date'])
+            df_aht_daily_raw['AHT'] = df_aht_daily_raw['AHT'].ffill()
+            df_aht_daily_raw['AHT_cleansed'], _ = cleanse_data_hw(df_aht_daily_raw, 'AHT', seasonal_periods=7, min_residual=10)
+
+            forecast_cof_daily = run_prophet_daily(df_cof_daily_raw, df_holidays, 'COF_cleansed', start_forecast, end_forecast, use_auto_payday=use_payday)
+            forecast_aht_daily = run_prophet_daily(df_aht_daily_raw, df_holidays, 'AHT_cleansed', start_forecast, end_forecast, use_auto_payday=use_payday)
+
+            max_hist_date = df_cof['Datetime'].max()
+            profile_start_date = max_hist_date - pd.DateOffset(months=months_profile)
+            
+            df_recent = pd.merge(
+                df_cof[df_cof['Datetime'] >= profile_start_date],
+                df_aht[df_aht['Datetime'] >= profile_start_date],
+                on='Datetime'
             )
+            df_recent['Time'] = df_recent['Datetime'].dt.time
+            df_recent['Is_Weekend'] = df_recent['Datetime'].dt.weekday >= 5
+            df_recent['Date_Only'] = df_recent['Datetime'].dt.date
+
+            daily_totals = df_recent.groupby(['Date_Only', 'Is_Weekend'])['COF'].sum().reset_index(name='Daily_Total_COF')
+            df_recent = pd.merge(df_recent, daily_totals, on=['Date_Only', 'Is_Weekend'])
+            df_recent['COF_Ratio'] = np.where(df_recent['Daily_Total_COF'] > 0, df_recent['COF'] / df_recent['Daily_Total_COF'], 0)
+            
+            daily_aht_mean = df_recent.replace({'AHT': 0}, np.nan).groupby(['Date_Only', 'Is_Weekend'])['AHT'].mean().reset_index(name='Daily_Mean_AHT')
+            df_recent = pd.merge(df_recent, daily_aht_mean, on=['Date_Only', 'Is_Weekend'])
+            df_recent['AHT_Ratio'] = np.where(df_recent['Daily_Mean_AHT'] > 0, df_recent['AHT'] / df_recent['Daily_Mean_AHT'], 1)
+
+            profile = df_recent.groupby(['Is_Weekend', 'Time']).agg(
+                COF_Ratio=('COF_Ratio', 'mean'),
+                AHT_Ratio=('AHT_Ratio', 'mean')
+            ).reset_index()
+            
+            sum_ratios_cof = profile.groupby('Is_Weekend')['COF_Ratio'].transform('sum')
+            profile['COF_Ratio'] = profile['COF_Ratio'] / sum_ratios_cof
+
+            forecast_dates = pd.date_range(start=start_forecast, end=end_forecast)
+            reconstructed_rows = []
+            
+            for d in forecast_dates:
+                d_date = d.date()
+                is_wkd = d.weekday() >= 5
+                
+                match_cof = forecast_cof_daily[forecast_cof_daily['Date'] == pd.to_datetime(d_date)]
+                match_aht = forecast_aht_daily[forecast_aht_daily['Date'] == pd.to_datetime(d_date)]
+                
+                if match_cof.empty or match_aht.empty: 
+                    continue
+                    
+                cof_daily_val = match_cof['COF_cleansed_daily_forecast'].values[0]
+                aht_daily_val = match_aht['AHT_cleansed_daily_forecast'].values[0]
+                
+                sub_profile = profile[profile['Is_Weekend'] == is_wkd]
+                for _, p_row in sub_profile.iterrows():
+                    dt_interval = pd.Timestamp.combine(d_date, p_row['Time'])
+                    reconstructed_rows.append({
+                        'Datetime': dt_interval, 
+                        'COF_forecast': cof_daily_val * p_row['COF_Ratio'],
+                        'AHT_forecast': aht_daily_val * p_row['AHT_Ratio']
+                    })
+                    
+            df_result = pd.DataFrame(reconstructed_rows)
+            df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
+            
+        with st.spinner("Kalkulasi Antrean Erlang C (Include Occupancy Target)..."):
+            erlang_results = [
+                calculate_agents_erlang(cof, aht, target_sl, max_wait_time) 
+                for cof, aht in zip(df_result['COF_forecast'], df_result['AHT_forecast'])
+            ]
+            
+            df_result['Agent_for_SL'] = [res[0] for res in erlang_results]
+            df_result['Projected_Wait_Time'] = [res[1] for res in erlang_results]
+            df_result['Service_Level_Achieved'] = [res[2] for res in erlang_results]
+            
+            df_result['Traffic_Erlangs'] = (df_result['COF_forecast'] * df_result['AHT_forecast']) / 1800
+            df_result['Agent_for_Occupancy'] = np.ceil(df_result['Traffic_Erlangs'] / max_occupancy)
+            
+            df_result['Base_Agent_Needed'] = np.maximum(df_result['Agent_for_SL'], df_result['Agent_for_Occupancy'])
+            df_result['Projected_Occupancy'] = np.where(df_result['Base_Agent_Needed'] > 0, df_result['Traffic_Erlangs'] / df_result['Base_Agent_Needed'], 0)
+            
+            df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
+            df_result['Date'] = df_result['Datetime'].dt.date
+            
+            total_monthly_headcount = math.ceil(((df_result.groupby('Date')['Agent_Needed_Adjust'].sum() * 0.5) / work_hours).mean() * ((pd.to_datetime(end_forecast) - pd.to_datetime(start_forecast)).days + 1) / work_days)
+            df_daily_workload_hours = df_result.groupby('Date')['Agent_Needed_Adjust'].sum() * 0.5
+            daily_headcount_needed = np.ceil(df_daily_workload_hours / work_hours)
+
+            df_daily = df_result.groupby('Date').agg(
+                Total_COF=('COF_forecast', 'sum'),
+                Rata_Rata_AHT=('AHT_forecast', 'mean'),
+                Max_Kebutuhan_Agent=('Agent_Needed_Adjust', 'max'),
+                Rata_Rata_SL=('Service_Level_Achieved', 'mean'),
+                Rata_Rata_Occ=('Projected_Occupancy', 'mean')
+            ).reset_index()
+
+            df_daily['Headcount_Harian_FTE'] = df_daily['Date'].map(daily_headcount_needed)
+
+            df_daily_display = df_daily.copy()
+            df_daily_display['Total_COF'] = df_daily_display['Total_COF'].astype(int) 
+            df_daily_display['Rata_Rata_AHT'] = df_daily_display['Rata_Rata_AHT'].apply(lambda x: f"{x:.0f} s")
+            df_daily_display['Headcount_Harian_FTE'] = df_daily_display['Headcount_Harian_FTE'].astype(int) 
+            df_daily_display['Max_Kebutuhan_Agent'] = df_daily_display['Max_Kebutuhan_Agent'].astype(int)
+            df_daily_display['Rata_Rata_SL'] = df_daily_display['Rata_Rata_SL'].apply(lambda x: f"{x:.2%}")
+            df_daily_display['Rata_Rata_Occ'] = df_daily_display['Rata_Rata_Occ'].apply(lambda x: f"{x:.2%}")
+            
+            df_daily_display = df_daily_display[['Date', 'Total_COF', 'Rata_Rata_AHT', 'Headcount_Harian_FTE', 'Max_Kebutuhan_Agent', 'Rata_Rata_SL', 'Rata_Rata_Occ']]
+            df_daily_display.columns = ['Tanggal', 'Total COF', 'Rata-rata AHT', 'Headcount Harian (FTE)', 'Kebutuhan Agent (Max/Peak)', 'Proyeksi SL', 'Proyeksi Occupancy']
+
+        with st.spinner(f"Menjalankan Optimasi Shift LP (Target: {opt_target})..."):
+            mode = 'Base' if 'Base' in opt_target else 'Adjusted'
+            df_shift_dist = optimize_shift_distribution_pulp(df_result, active_shifts, shift_duration, target_mode=mode)
+
+        st.success("🎉 Kalkulasi Optimasi Selesai!")
+        
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "📊 Forecast", "👥 Kapasitas (Bulanan)", "📅 Hasil Harian", "⏱️ Detail Interval", "🧩 Distribusi Shift"
+        ])
+        
+        with tab1:
+            st.line_chart(df_result.set_index('Datetime')['COF_forecast'])
+        with tab2:
+            st.metric("Total Headcount Manusia (FTE)", total_monthly_headcount)
+        with tab3:
+            st.dataframe(df_daily_display, use_container_width=True)
+        with tab4:
+            st.dataframe(df_result[['Datetime', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Projected_Occupancy']], use_container_width=True)
+        with tab5:
+            st.markdown(f"**Target Optimasi Terpilih: {opt_target}**")
+            st.markdown("Algoritma kini diatur dengan **Hard Constraint**: Jumlah agen tidak akan pernah di bawah batas target yang Anda pilih, sehingga Service Level di setiap interval akan terjamin.")
+            
+            if not df_shift_dist.empty:
+                st.dataframe(df_shift_dist, use_container_width=True)
+                df_chart = df_shift_dist.set_index('Tanggal').drop(columns=['Total_Agent_Shift'])
+                st.bar_chart(df_chart)
+
+        # Download Button
+        st.write("---")
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df_daily_display.to_excel(writer, sheet_name='Hasil_Harian', index=False)
+            df_result[['Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust', 'Service_Level_Achieved', 'Projected_Wait_Time', 'Projected_Occupancy']].to_excel(writer, sheet_name='Detail_Interval', index=False)
+            if not df_shift_dist.empty:
+                df_shift_dist.to_excel(writer, sheet_name='Distribusi_Shift', index=False)
+        
+        st.download_button(
+            label="📥 Download Laporan Lengkap (Excel)",
+            data=output.getvalue(),
+            file_name=f"Forecast_WFM_Include_Occ_{start_forecast}_to_{end_forecast}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    else:
+        st.info("Upload file COF dan AHT untuk memulai.")
+
