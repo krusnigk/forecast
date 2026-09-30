@@ -6,6 +6,7 @@ import io
 import datetime
 import re
 import traceback
+import uuid
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import warnings
@@ -51,28 +52,46 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
     unique_dates = df_process['Date'].unique()
     col_target = 'Base_Agent_Needed' if target_mode == 'Base' else 'Agent_Needed_Adjust'
     
+    # 1. Generate Unique Run ID untuk mencegah memori bertabrakan di Streamlit
+    run_id = uuid.uuid4().hex[:6]
+    
     for d in unique_dates:
         df_day = df_process[df_process['Date'] == d].sort_values('Datetime').copy()
-        prob = pulp.LpProblem(f"Shift_Allocation_{d}", pulp.LpMinimize)
-        shift_vars = {s_code: pulp.LpVariable(f"{s_code}", lowBound=0, cat='Integer') for s_code in shift_items.keys()}
+        
+        # 2. Bersihkan nama problem dari karakter strip (-)
+        clean_d = str(d).replace("-", "_")
+        prob = pulp.LpProblem(f"Shift_Allocation_{clean_d}_{run_id}", pulp.LpMinimize)
+        
+        # 3. Buat variabel shift dengan nama Unik & Aman (Ganti titik dengan underscore)
+        shift_vars = {}
+        for s_code in shift_items.keys():
+            safe_s_code = str(s_code).replace(".", "_")
+            var_name = f"Shift_{safe_s_code}_{clean_d}_{run_id}"
+            shift_vars[s_code] = pulp.LpVariable(var_name, lowBound=0, cat=pulp.LpInteger)
+            
         surplus_vars = []
         
         for _, row in df_day.iterrows():
             dt = row['Datetime']
             req = row[col_target]
             active_shifts_in_interval = []
+            
             for s_code, s_start_td in shift_items.items():
                 shift_start_dt = pd.to_datetime(str(d)) + s_start_td
                 shift_end_dt = shift_start_dt + pd.Timedelta(hours=shift_duration_hours)
+                
                 if shift_start_dt <= dt < shift_end_dt:
                     active_shifts_in_interval.append(shift_vars[s_code])
                 elif (shift_start_dt - pd.Timedelta(days=1)) <= dt < (shift_end_dt - pd.Timedelta(days=1)):
                     active_shifts_in_interval.append(shift_vars[s_code])
             
             interval_str = dt.strftime('%H%M')
-            surplus = pulp.LpVariable(f"Surplus_{interval_str}", lowBound=0)
+            
+            var_surplus_name = f"Surplus_{interval_str}_{clean_d}_{run_id}"
+            surplus = pulp.LpVariable(var_surplus_name, lowBound=0)
             surplus_vars.append(surplus)
-            prob += pulp.lpSum(active_shifts_in_interval) - surplus == req, f"Req_{interval_str}"
+            
+            prob += pulp.lpSum(active_shifts_in_interval) - surplus == req, f"Req_{interval_str}_{run_id}"
             
         prob += pulp.lpSum([shift_vars[s_code] for s_code in shift_items.keys()]) + 0.01 * pulp.lpSum(surplus_vars)
         prob.solve(pulp.PULP_CBC_CMD(msg=0))
@@ -89,6 +108,7 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
                 row_res[s_code] = 0
         row_res['Total_Agent_Shift'] = total
         results.append(row_res)
+        
     return pd.DataFrame(results)
 
 # --- FUNGSI ERLANG & AI ---
@@ -181,7 +201,7 @@ menu = st.sidebar.radio("Pilih Halaman:", ["📊 Forecast & Planner", "🗄️ D
 st.sidebar.divider()
 
 # ==========================================
-# HALAMAN 1 & 2
+# HALAMAN 1: FORECAST & PLANNER
 # ==========================================
 if menu == "📊 Forecast & Planner":
     st.header("WFM Forecast & Capacity Planning")
@@ -279,6 +299,9 @@ if menu == "📊 Forecast & Planner":
                 df_shift_dist.to_excel(writer, sheet_name='Distribusi_Shift', index=False)
             st.download_button("📥 Download Excel Forecast", output.getvalue(), "Forecast_Result.xlsx")
 
+# ==========================================
+# HALAMAN 2: DATABASE AGENT & TARGET
+# ==========================================
 elif menu == "🗄️ Database Agent & Target":
     st.header("🗄️ Manajemen Database Agent & Target Komposisi")
     
@@ -322,7 +345,7 @@ elif menu == "🗄️ Database Agent & Target":
     st.session_state['shift_target'] = edited_comp
 
 # ==========================================
-# HALAMAN 3: AUTO ROSTERING MACHINE (EQUITY UPDATE)
+# HALAMAN 3: AUTO ROSTERING MACHINE
 # ==========================================
 elif menu == "🤖 Auto Rostering":
     st.header("🤖 Mesin Auto-Rostering Berbasis Ketersediaan & Keadilan")
@@ -583,7 +606,7 @@ elif menu == "🤖 Auto Rostering":
                                             # Update S11 Trackers
                                             if s_code == 'S11':
                                                 agent_stats[target_row]['s11_consecutive_count'] += 1
-                                                agent_stats[target_row]['s11_total_count'] += 1 # Tambah Total Bulanan
+                                                agent_stats[target_row]['s11_total_count'] += 1 
                                             else:
                                                 agent_stats[target_row]['s11_consecutive_count'] = 0
                                             
@@ -629,7 +652,7 @@ elif menu == "🤖 Auto Rostering":
                                         
                                         if fallback_shift == 'S11':
                                             agent_stats[target_row]['s11_consecutive_count'] += 1
-                                            agent_stats[target_row]['s11_total_count'] += 1 # Update Fallback Tracker
+                                            agent_stats[target_row]['s11_total_count'] += 1
                                         else:
                                             agent_stats[target_row]['s11_consecutive_count'] = 0
                                             
@@ -678,7 +701,7 @@ elif menu == "🤖 Auto Rostering":
                                     
                                     if val == 'S11':
                                         agent_stats[idx]['s11_consecutive_count'] += 1
-                                        agent_stats[idx]['s11_total_count'] += 1 # Update Non-IN Tracker
+                                        agent_stats[idx]['s11_total_count'] += 1
                                     else:
                                         agent_stats[idx]['s11_consecutive_count'] = 0
                                         
