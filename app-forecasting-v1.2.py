@@ -126,7 +126,7 @@ menu = st.sidebar.radio("Pilih Halaman:", ["📊 Forecast & Planner", "🗄️ D
 st.sidebar.divider()
 
 # ==========================================
-# HALAMAN 1: FORECAST & PLANNER (TANPA PULP)
+# HALAMAN 1: FORECAST & PLANNER (TANPA PULP + OCCUPANCY + DAILY)
 # ==========================================
 if menu == "📊 Forecast & Planner":
     st.header("WFM Forecast & Capacity Planning")
@@ -135,10 +135,11 @@ if menu == "📊 Forecast & Planner":
     file_aht = st.sidebar.file_uploader("Upload Data AHT", type=['csv', 'xlsx'])
     file_holidays = st.sidebar.file_uploader("Upload Data Libur (Opsional)", type=['csv', 'xlsx'])
 
-    st.sidebar.header("⚙️ 2. Konfigurasi")
+    st.sidebar.header("⚙️ 2. Konfigurasi Target")
     target_sl = st.sidebar.slider("Target Service Level (%)", 50, 100, 90) / 100
     max_wait_time = st.sidebar.number_input("Target ASA (Detik)", value=20)
-    shrinkage = st.sidebar.number_input("Shrinkage (%)", 0.0, 100.0, 30.0) / 100
+    max_occupancy = st.sidebar.slider("Batas Maksimal Occupancy (%)", 50, 100, 85) / 100
+    shrinkage = st.sidebar.number_input("Tingkat Shrinkage (%)", 0.0, 100.0, 30.0) / 100
 
     st.sidebar.header("📅 3. Tanggal")
     start_hist = st.sidebar.date_input("Mulai Data Historis", pd.to_datetime('2024-02-01'))
@@ -148,7 +149,7 @@ if menu == "📊 Forecast & Planner":
 
     if st.button("Jalankan Forecast & Kalkulasi Kebutuhan", type="primary"):
         if file_cof and file_aht:
-            with st.spinner("Memproses AI Prophet & Erlang C..."):
+            with st.spinner("Memproses AI Prophet, Erlang C & Analisis Occupancy..."):
                 def robust_wfm_parser(uploaded_file, col_target):
                     df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('csv') else pd.read_excel(uploaded_file)
                     if df[col_target].dtype == 'object': df[col_target] = df[col_target].astype(str).str.replace(',', '.').astype(float)
@@ -201,22 +202,73 @@ if menu == "📊 Forecast & Planner":
                 df_result = pd.DataFrame(recon_rows)
                 df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
                 
-                erlang_res = [calculate_agents_erlang(c, a, target_sl, max_wait_time) for c, a in zip(df_result['COF_forecast'], df_result['AHT_forecast'])]
-                df_result['Base_Agent_Needed'] = [r[0] for r in erlang_res]
-                df_result['Agent_Needed_Adjust'] = np.ceil(df_result['Base_Agent_Needed'] / (1 - shrinkage))
+                # --- KALKULASI ERLANG, OCCUPANCY, & SHRINKAGE ---
+                base_agents = []
+                adj_agents = []
+                occupancies = []
+                
+                for c, a in zip(df_result['COF_forecast'], df_result['AHT_forecast']):
+                    if pd.isna(c) or c <= 0:
+                        base_agents.append(0)
+                        adj_agents.append(0)
+                        occupancies.append(0.0)
+                        continue
+                        
+                    # 1. Hitung Erlang C (Memenuhi target Service Level)
+                    erlang_ag, asa, sl = calculate_agents_erlang(c, a, target_sl, max_wait_time)
+                    traffic = (c * a) / 1800.0
+                    
+                    # 2. Hitung Occupancy & Koreksi jika Overload
+                    occ = traffic / erlang_ag if erlang_ag > 0 else 0
+                    if occ > max_occupancy:
+                        erlang_ag = math.ceil(traffic / max_occupancy) # Tambah agent agar occupancy turun
+                        occ = traffic / erlang_ag if erlang_ag > 0 else 0
+                        
+                    base_agents.append(erlang_ag)
+                    occupancies.append(occ)
+                    
+                    # 3. Terapkan Shrinkage ke Kebutuhan Final
+                    final_ag = math.ceil(erlang_ag / (1.0 - shrinkage)) if shrinkage < 1.0 else erlang_ag
+                    adj_agents.append(final_ag)
+                    
+                df_result['Base_Agent_Needed'] = base_agents
+                df_result['Occupancy_Rate'] = occupancies
+                df_result['Agent_Needed_Adjust'] = adj_agents
                 df_result['Date'] = df_result['Datetime'].dt.date
                 
-                # Susun ulang kolom agar lebih mudah dibaca
-                df_display = df_result[['Date', 'Datetime', 'COF_forecast', 'AHT_forecast', 'Base_Agent_Needed', 'Agent_Needed_Adjust']]
+                # Format dataframe detail per interval
+                df_display = df_result[['Date', 'Datetime', 'COF_forecast', 'AHT_forecast', 'Occupancy_Rate', 'Base_Agent_Needed', 'Agent_Needed_Adjust']].copy()
+                df_display['Occupancy_Rate'] = (df_display['Occupancy_Rate'] * 100).round(2).astype(str) + '%'
+                
+                # --- KALKULASI SUMMARY DAILY ---
+                df_daily = df_result.groupby('Date').agg(
+                    Total_COF=('COF_forecast', 'sum'),
+                    Avg_AHT=('AHT_forecast', 'mean'),
+                    Peak_Agent_Interval=('Agent_Needed_Adjust', 'max'),
+                    Avg_Occupancy=('Occupancy_Rate', 'mean')
+                ).reset_index()
+                
+                df_daily['Total_COF'] = np.ceil(df_daily['Total_COF']).astype(int)
+                df_daily['Avg_AHT'] = np.round(df_daily['Avg_AHT'], 2)
+                df_daily['Avg_Occupancy'] = (df_daily['Avg_Occupancy'] * 100).round(2).astype(str) + '%'
                 
             st.success("🎉 Forecast & Kalkulasi Kebutuhan Erlang C Selesai!")
-            st.info("Gunakan data kebutuhan per 30 menit ini untuk menyusun Target Komposisi Shift secara manual.")
-            st.dataframe(df_display, use_container_width=True)
+            st.info("Kebutuhan agen akhir (Agent Needed Adjust) telah memperhitungkan target Service Level, batas Occupancy, dan Shrinkage.")
             
+            # Tampilkan 2 Tab: Summary Harian & Detail Interval
+            tab1, tab2 = st.tabs(["📅 Summary Harian (Per Day)", "⏱️ Detail Interval (Per 30 Menit)"])
+            with tab1:
+                st.dataframe(df_daily, use_container_width=True)
+            with tab2:
+                st.dataframe(df_display, use_container_width=True)
+            
+            # Gabungkan ke dalam satu file Excel multi-sheet
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                df_display.to_excel(writer, sheet_name='Kebutuhan_Agent_Interval', index=False)
-            st.download_button("📥 Download Excel Kebutuhan per Interval", output.getvalue(), "ErlangC_Requirement.xlsx")
+                df_daily.to_excel(writer, sheet_name='Daily_Summary', index=False)
+                df_display.to_excel(writer, sheet_name='Interval_Detail', index=False)
+                
+            st.download_button("📥 Download Excel Kebutuhan Agent", output.getvalue(), "Forecast_Requirement.xlsx")
 
 # ==========================================
 # HALAMAN 2: DATABASE AGENT & TARGET
