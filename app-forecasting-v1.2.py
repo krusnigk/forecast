@@ -5,6 +5,7 @@ import math
 import io
 import datetime
 import re
+import traceback
 import uuid
 from prophet import Prophet
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
@@ -51,20 +52,22 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
     unique_dates = df_process['Date'].unique()
     col_target = 'Base_Agent_Needed' if target_mode == 'Base' else 'Agent_Needed_Adjust'
     
-    # Generate Unique Run ID untuk mencegah memori bertabrakan di Streamlit
-    run_id = uuid.uuid4().hex[:6]
+    # Generate Unique Run ID untuk mencegah memori bertabrakan di Streamlit Cloud
+    run_id = str(uuid.uuid4().hex[:6])
     
     for d in unique_dates:
         df_day = df_process[df_process['Date'] == d].sort_values('Datetime').copy()
         clean_d = str(d).replace("-", "_")
         prob = pulp.LpProblem(f"Shift_Allocation_{clean_d}_{run_id}", pulp.LpMinimize)
         
-        # Sanitasi nama variabel (Ganti titik dengan underscore & pasang ID unik)
+        # 1. Sanitasi nama variabel secara ekstrem agar aman di memori PuLP Linux
         shift_vars = {}
         for s_code in shift_items.keys():
-            safe_s_code = str(s_code).replace(".", "_")
+            safe_s_code = str(s_code).replace(".", "_").replace("-", "_").replace(" ", "_")
             var_name = f"Shift_{safe_s_code}_{clean_d}_{run_id}"
-            shift_vars[s_code] = pulp.LpVariable(var_name, lowBound=0, cat=pulp.LpInteger)
+            
+            # FIX UTAMA: Pemanggilan explicit menggunakan string murni 'Integer'
+            shift_vars[s_code] = pulp.LpVariable(name=str(var_name), lowBound=0, cat='Integer')
             
         surplus_vars = []
         
@@ -75,7 +78,7 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
             
             for s_code, s_start_td in shift_items.items():
                 shift_start_dt = pd.to_datetime(str(d)) + s_start_td
-                shift_end_dt = shift_start_dt + pd.Timedelta(hours=shift_duration_hours)
+                shift_end_dt = shift_start_dt + pd.Timedelta(hours=float(shift_duration_hours))
                 
                 if shift_start_dt <= dt < shift_end_dt:
                     active_shifts_in_interval.append(shift_vars[s_code])
@@ -83,10 +86,11 @@ def optimize_shift_distribution_pulp(df_result, master_shifts, shift_duration_ho
                     active_shifts_in_interval.append(shift_vars[s_code])
             
             interval_str = dt.strftime('%H%M')
-            surplus = pulp.LpVariable(f"Surplus_{interval_str}_{clean_d}_{run_id}", lowBound=0)
+            var_surplus_name = f"Surplus_{interval_str}_{clean_d}_{run_id}"
+            surplus = pulp.LpVariable(name=str(var_surplus_name), lowBound=0)
             surplus_vars.append(surplus)
             
-            prob += pulp.lpSum(active_shifts_in_interval) - surplus == req, f"Req_{interval_str}_{run_id}"
+            prob += pulp.lpSum(active_shifts_in_interval) - surplus == float(req), f"Req_{interval_str}_{run_id}"
             
         prob += pulp.lpSum([shift_vars[s_code] for s_code in shift_items.keys()]) + 0.01 * pulp.lpSum(surplus_vars)
         prob.solve(pulp.PULP_CBC_CMD(msg=0))
