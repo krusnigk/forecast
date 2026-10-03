@@ -126,7 +126,7 @@ menu = st.sidebar.radio("Pilih Halaman:", ["📊 Forecast & Planner", "🗄️ D
 st.sidebar.divider()
 
 # ==========================================
-# HALAMAN 1: FORECAST & PLANNER (UPDATED AHT PROFILE)
+# HALAMAN 1: FORECAST & PLANNER
 # ==========================================
 if menu == "📊 Forecast & Planner":
     st.header("WFM Forecast & Capacity Planning")
@@ -178,27 +178,21 @@ if menu == "📊 Forecast & Planner":
                 fcst_cof = run_prophet_daily(df_cof_daily, None, 'COF_cleansed', start_forecast, end_forecast, True)
                 fcst_aht = run_prophet_daily(df_aht_daily, None, 'AHT_cleansed', start_forecast, end_forecast, True)
 
-                # --- 3 BULAN TERAKHIR UNTUK PROFILING ---
                 profile_start = df_cof['Datetime'].max() - pd.DateOffset(months=3)
                 df_recent = pd.merge(df_cof[df_cof['Datetime'] >= profile_start], df_aht[df_aht['Datetime'] >= profile_start], on='Datetime')
                 df_recent['Time'] = df_recent['Datetime'].dt.time
                 df_recent['Is_Weekend'] = df_recent['Datetime'].dt.weekday >= 5
                 df_recent['Date_Only'] = df_recent['Datetime'].dt.date
                 
-                # 1. COF Profiling (Rasio Volume)
                 daily_totals = df_recent.groupby(['Date_Only', 'Is_Weekend'])['COF'].sum().reset_index(name='Tot_COF')
                 df_recent = pd.merge(df_recent, daily_totals, on=['Date_Only', 'Is_Weekend'])
                 df_recent['COF_Ratio'] = np.where(df_recent['Tot_COF'] > 0, df_recent['COF'] / df_recent['Tot_COF'], 0)
                 
-                # 2. AHT Profiling (Multiplier Intraday)
                 df_aht_valid = df_recent[df_recent['AHT'] > 0].copy()
                 if not df_aht_valid.empty:
-                    # Rata-rata AHT per interval 30 menit
                     aht_prof = df_aht_valid.groupby(['Is_Weekend', 'Time'])['AHT'].mean().reset_index(name='AHT_Mean')
-                    # Rata-rata AHT base harian
                     aht_base = aht_prof.groupby('Is_Weekend')['AHT_Mean'].mean().reset_index(name='AHT_Base')
                     aht_prof = pd.merge(aht_prof, aht_base, on='Is_Weekend')
-                    # Cari multiplier: Interval ini berapa kali lipat dibanding harian?
                     aht_prof['AHT_Multiplier'] = aht_prof['AHT_Mean'] / aht_prof['AHT_Base']
                 else:
                     aht_prof = pd.DataFrame(columns=['Is_Weekend', 'Time', 'AHT_Multiplier'])
@@ -206,9 +200,8 @@ if menu == "📊 Forecast & Planner":
                 profile = df_recent.groupby(['Is_Weekend', 'Time']).agg(COF_Ratio=('COF_Ratio', 'mean')).reset_index()
                 profile['COF_Ratio'] = profile['COF_Ratio'] / profile.groupby('Is_Weekend')['COF_Ratio'].transform('sum')
                 
-                # Gabungkan Profile COF & AHT
                 profile = pd.merge(profile, aht_prof[['Is_Weekend', 'Time', 'AHT_Multiplier']], on=['Is_Weekend', 'Time'], how='left')
-                profile['AHT_Multiplier'] = profile['AHT_Multiplier'].fillna(1.0) # Fallback ke 1 jika data kosong
+                profile['AHT_Multiplier'] = profile['AHT_Multiplier'].fillna(1.0)
 
                 recon_rows = []
                 for d in pd.date_range(start_forecast, end_forecast):
@@ -219,7 +212,6 @@ if menu == "📊 Forecast & Planner":
                     
                     sub_p = profile[profile['Is_Weekend'] == is_wkd]
                     for _, pr in sub_p.iterrows():
-                        # AHT Forecast = AHT Harian Prophet * Multiplier Jam Tersebut
                         recon_rows.append({
                             'Datetime': pd.Timestamp.combine(d_date, pr['Time']), 
                             'COF_forecast': c_val * pr['COF_Ratio'], 
@@ -228,9 +220,8 @@ if menu == "📊 Forecast & Planner":
                         
                 df_result = pd.DataFrame(recon_rows)
                 df_result['COF_forecast'] = np.ceil(df_result['COF_forecast']).astype(int)
-                df_result['AHT_forecast'] = np.round(df_result['AHT_forecast']).astype(int) # Dibulatkan jadi detik bulat
+                df_result['AHT_forecast'] = np.round(df_result['AHT_forecast']).astype(int) 
                 
-                # --- KALKULASI ERLANG, OCCUPANCY, & SHRINKAGE ---
                 base_agents = []
                 adj_agents = []
                 occupancies = []
@@ -264,32 +255,59 @@ if menu == "📊 Forecast & Planner":
                 df_display = df_result[['Date', 'Datetime', 'COF_forecast', 'AHT_forecast', 'Occupancy_Rate', 'Base_Agent_Needed', 'Agent_Needed_Adjust']].copy()
                 df_display['Occupancy_Rate'] = (df_display['Occupancy_Rate'] * 100).round(2).astype(str) + '%'
                 
+                # --- KALKULASI SUMMARY HARIAN ---
                 df_daily = df_result.groupby('Date').agg(
                     Total_COF=('COF_forecast', 'sum'),
                     Avg_AHT=('AHT_forecast', 'mean'),
-                    Peak_Agent_Interval=('Agent_Needed_Adjust', 'max'),
+                    Peak_Base_Agent=('Base_Agent_Needed', 'max'),
+                    Peak_Adjusted_Agent=('Agent_Needed_Adjust', 'max'),
                     Avg_Occupancy=('Occupancy_Rate', 'mean')
                 ).reset_index()
                 
                 df_daily['Total_COF'] = np.ceil(df_daily['Total_COF']).astype(int)
-                df_daily['Avg_AHT'] = np.round(df_daily['Avg_AHT'], 2) # Summary AHT harian dirata-rata ulang
+                df_daily['Avg_AHT'] = np.round(df_daily['Avg_AHT'], 2)
+                
+                # --- KALKULASI SUMMARY BULANAN ---
+                # Ekstrak nama bulan untuk tampilan (Misal: "June 2026")
+                target_month_name = pd.to_datetime(start_forecast).strftime('%B %Y')
+                
+                total_cof_bulan = df_daily['Total_COF'].sum()
+                avg_aht_bulan = df_daily['Avg_AHT'].mean()
+                peak_base_bulan = df_daily['Peak_Base_Agent'].max()
+                peak_adj_bulan = df_daily['Peak_Adjusted_Agent'].max()
+                avg_occ_bulan = df_daily['Avg_Occupancy'].mean()
+                
+                df_monthly = pd.DataFrame([{
+                    'Bulan': target_month_name,
+                    'Total_COF': total_cof_bulan,
+                    'Avg_AHT': np.round(avg_aht_bulan, 2),
+                    'Base_Agent_Needed (Inc. Occupancy)': peak_base_bulan,
+                    'Agent_Needed_Adjust (Inc. Shrinkage)': peak_adj_bulan,
+                    'Avg_Occupancy': f"{(avg_occ_bulan * 100):.2f}%"
+                }])
+
+                # Merubah persentase Occupancy Harian menjadi string untuk tampilan akhir
                 df_daily['Avg_Occupancy'] = (df_daily['Avg_Occupancy'] * 100).round(2).astype(str) + '%'
                 
             st.success("🎉 Forecast & Kalkulasi Kebutuhan Erlang C Selesai!")
-            st.info("Kebutuhan agen akhir (Agent Needed Adjust) telah memperhitungkan target Service Level, batas Occupancy, dan Shrinkage.")
+            st.info("Kebutuhan agen dihitung menggunakan metodologi Erlang C + Max Occupancy Capping.")
             
-            tab1, tab2 = st.tabs(["📅 Summary Harian (Per Day)", "⏱️ Detail Interval (Per 30 Menit)"])
+            # Tampilkan 3 Tab: Summary Bulanan, Summary Harian & Detail Interval
+            tab1, tab2, tab3 = st.tabs([f"📊 Summary Bulanan ({target_month_name})", "📅 Summary Harian", "⏱️ Detail Interval"])
             with tab1:
-                st.dataframe(df_daily, use_container_width=True)
+                st.dataframe(df_monthly, use_container_width=True)
             with tab2:
+                st.dataframe(df_daily, use_container_width=True)
+            with tab3:
                 st.dataframe(df_display, use_container_width=True)
             
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df_monthly.to_excel(writer, sheet_name='Monthly_Summary', index=False)
                 df_daily.to_excel(writer, sheet_name='Daily_Summary', index=False)
                 df_display.to_excel(writer, sheet_name='Interval_Detail', index=False)
                 
-            st.download_button("📥 Download Excel Kebutuhan Agent", output.getvalue(), "Forecast_Requirement.xlsx")
+            st.download_button("📥 Download Excel Kebutuhan Agent", output.getvalue(), "Forecast_Requirement_Complete.xlsx")
 
 # ==========================================
 # HALAMAN 2: DATABASE AGENT & TARGET
